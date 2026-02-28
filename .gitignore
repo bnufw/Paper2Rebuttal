@@ -25,6 +25,7 @@ venv/
 .DS_Store
 Thumbs.db
 
+.worktrees/
 gradio_uploads/
 arxiv_papers/
 arxiv_papers_md/
