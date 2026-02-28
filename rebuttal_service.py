@@ -12,6 +12,8 @@ from enum import Enum
 from llm import LLMClient, TokenUsageTracker
 from arxiv import search_relevant_papers
 from tools import _read_text, load_prompt, pdf_to_md, download_pdf_and_convert_md, _fix_json_escapes
+from compliance_guard import apply_icml_tense_fixes, scan_compliance_violations, format_violations
+from char_budget import ensure_within_char_limit, split_must_keep_points
 
 
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -94,6 +96,7 @@ class QuestionState:
     """State of a single question"""
     question_id: int
     question_text: str
+    reviewer_id: str = ""
     status: ProcessStatus = ProcessStatus.NOT_STARTED
     
     reference_paper_summary: str = ""
@@ -112,6 +115,8 @@ class SessionState:
     paper_file_path: str = ""
     review_file_path: str = ""
     paper_summary: str = ""
+    conference_mode: str = "generic"
+    reviewer_reviews: Dict[str, str] = field(default_factory=dict)
     
     session_dir: str = ""       
     logs_dir: str = ""        
@@ -122,6 +127,8 @@ class SessionState:
     
     overall_status: ProcessStatus = ProcessStatus.NOT_STARTED
     final_rebuttal: str = ""
+    final_openreview_rebuttals: Dict[str, str] = field(default_factory=dict)
+    final_openreview_followups: Dict[str, str] = field(default_factory=dict)
 
     progress_message: str = ""
     
@@ -204,6 +211,156 @@ class Agent2:
             with open(os.path.join(self.log_dir, "agent2_output.txt"), "w", encoding="utf-8") as f:
                 f.write(self.final_text or "(empty)")
         
+        return self.final_text
+
+
+def _extract_first_json_object(text: str) -> str:
+    """Best-effort extraction of the first top-level JSON object from a noisy LLM output."""
+    if not text:
+        return ""
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return ""
+    return text[start : end + 1]
+
+
+def extract_openreview_reviews(agent2_output: str) -> Tuple[Dict[str, str], List[Tuple[str, str]]]:
+    """
+    Parse OpenReview per-reviewer extraction JSON.
+
+    Returns:
+    - reviewer_reviews: reviewer_id -> raw_review
+    - questions: list of (reviewer_id, question_text) pairs (order preserved)
+    """
+    json_str = _extract_first_json_object(agent2_output)
+    if not json_str:
+        raise ValueError("No JSON object found in Agent2 OpenReview output")
+
+    try:
+        json_str = _fix_json_escapes(json_str)
+        data = json.loads(json_str)
+    except Exception as e:
+        raise ValueError(f"Failed to parse Agent2 OpenReview JSON: {e}") from e
+
+    reviews = data.get("reviews")
+    if not isinstance(reviews, list) or not reviews:
+        raise ValueError("Agent2 OpenReview JSON missing non-empty 'reviews' list")
+
+    reviewer_reviews: Dict[str, str] = {}
+    question_pairs: List[Tuple[str, str]] = []
+    for item in reviews:
+        if not isinstance(item, dict):
+            continue
+        reviewer_id = (item.get("reviewer_id") or "R?").strip() or "R?"
+        raw_review = (item.get("raw_review") or "").strip()
+        questions = item.get("questions") or []
+        if raw_review:
+            reviewer_reviews[reviewer_id] = raw_review
+        if isinstance(questions, list):
+            for q in questions:
+                q_text = (q or "").strip()
+                if q_text:
+                    question_pairs.append((reviewer_id, q_text))
+
+    if not question_pairs:
+        raise ValueError("Agent2 OpenReview JSON contained no questions")
+
+    return reviewer_reviews, question_pairs
+
+
+class Agent2OpenReview:
+    """Extract per-reviewer questions in OpenReview JSON format"""
+
+    def __init__(self, paper_summary: str, review_file_path: str, temperature: float = 0.2, log_dir: str = None):
+        self.paper_summary = paper_summary
+        self.review_file_path = review_file_path
+        self.temperature = temperature
+        self.log_dir = log_dir
+        self.final_text = None
+
+    def _build_context(self, paper_summary: str, review_text: str) -> str:
+        instructions = load_prompt("icml_openreview_question_extractor.yaml")
+        return (
+            f"{instructions}"
+            f"[compressed paper]\n\n{paper_summary}\n```\n\n"
+            f"[review original text]\n\n{review_text}\n```\n"
+            f"\n**Begin extraction now.**\n"
+        )
+
+    def run(self) -> str:
+        review_text = _read_text(self.review_file_path)
+        model_input = self._build_context(self.paper_summary, review_text)
+        instructions_text = "Please think very carefully and rigorously before answering, and never fabricate anything"
+
+        if self.log_dir:
+            with open(os.path.join(self.log_dir, "agent2_openreview_input.txt"), "w", encoding="utf-8") as f:
+                f.write(f"=== INSTRUCTIONS ===\n{instructions_text}\n\n=== MODEL INPUT ===\n{model_input}")
+
+        self.final_text, _ = get_llm_client().generate(
+            instructions=instructions_text,
+            input_text=model_input,
+            enable_reasoning=True,
+            temperature=self.temperature,
+            agent_name="Agent2_openreview_extract_questions",
+        )
+
+        if self.log_dir:
+            with open(os.path.join(self.log_dir, "agent2_openreview_output.txt"), "w", encoding="utf-8") as f:
+                f.write(self.final_text or "(empty)")
+
+        return self.final_text
+
+
+class Agent2OpenReviewChecker:
+    """Check and correct OpenReview JSON extraction"""
+
+    def __init__(
+        self,
+        paper_summary: str,
+        review_file_path: str,
+        agent2_output: str,
+        temperature: float = 0.2,
+        log_dir: str = None,
+    ):
+        self.paper_summary = paper_summary
+        self.review_file_path = review_file_path
+        self.agent2_output = agent2_output
+        self.temperature = temperature
+        self.log_dir = log_dir
+        self.final_text = None
+
+    def _build_context(self) -> str:
+        review_text = _read_text(self.review_file_path)
+        instructions = load_prompt("icml_openreview_question_extractor_checker.yaml")
+        return (
+            f"{instructions}"
+            f"[compressed paper]\n\n{self.paper_summary}\n```\n\n"
+            f"[review original text]\n\n{review_text}\n```\n"
+            f"[student output]\n\n{self.agent2_output}\n"
+            f"\n**Begin now.**\n"
+        )
+
+    def run(self) -> str:
+        model_input = self._build_context()
+        instructions_text = "Please think very carefully and rigorously before answering, and never fabricate anything"
+
+        if self.log_dir:
+            with open(os.path.join(self.log_dir, "agent2_openreview_checker_input.txt"), "w", encoding="utf-8") as f:
+                f.write(f"=== INSTRUCTIONS ===\n{instructions_text}\n\n=== MODEL INPUT ===\n{model_input}")
+
+        self.final_text, _ = get_llm_client().generate(
+            instructions=instructions_text,
+            input_text=model_input,
+            enable_reasoning=True,
+            temperature=self.temperature,
+            agent_name="Agent2_openreview_checker",
+        )
+
+        if self.log_dir:
+            with open(os.path.join(self.log_dir, "agent2_openreview_checker_output.txt"), "w", encoding="utf-8") as f:
+                f.write(self.final_text or "(empty)")
+
         return self.final_text
 
 
@@ -939,6 +1096,10 @@ class RebuttalService:
         if summary_data:
             paper_path = summary_data.get("paper_path", "")
             review_path = summary_data.get("review_path", "")
+            session.conference_mode = (summary_data.get("conference_mode") or "generic").strip() or "generic"
+            reviewer_reviews = summary_data.get("reviewer_reviews")
+            if isinstance(reviewer_reviews, dict):
+                session.reviewer_reviews = {str(k): str(v) for k, v in reviewer_reviews.items() if v is not None}
 
         session.paper_file_path = self._resolve_existing_path([
             paper_path,
@@ -969,6 +1130,18 @@ class RebuttalService:
         if os.path.exists(final_rebuttal_path):
             session.final_rebuttal = self._read_text_safe(final_rebuttal_path)
 
+        openreview_path = os.path.join(logs_dir, "openreview_rebuttals.json")
+        if os.path.exists(openreview_path):
+            data = self._load_json_safe(openreview_path)
+            if isinstance(data, dict):
+                session.final_openreview_rebuttals = {str(k): str(v) for k, v in data.items() if v is not None}
+
+        followup_path = os.path.join(logs_dir, "openreview_followups.json")
+        if os.path.exists(followup_path):
+            data = self._load_json_safe(followup_path)
+            if isinstance(data, dict):
+                session.final_openreview_followups = {str(k): str(v) for k, v in data.items() if v is not None}
+
         # Build a map of question_id -> reference_paper_summary from summary_data
         ref_summary_map: Dict[int, str] = {}
         if summary_data and isinstance(summary_data.get("questions"), list):
@@ -984,6 +1157,7 @@ class RebuttalService:
                 q_state = QuestionState(
                     question_id=int(q.get("question_id", 0) or 0),
                     question_text=q.get("question_text", "") or "",
+                    reviewer_id=q.get("reviewer_id", "") or "",
                     revision_count=int(q.get("revision_count", 0) or 0),
                     is_satisfied=bool(q.get("is_satisfied", False)),
                 )
@@ -1137,6 +1311,8 @@ class RebuttalService:
                 "paper_path": session.paper_file_path,
                 "review_path": session.review_file_path,
                 "paper_summary": session.paper_summary,  # Persist paper_summary for restoration
+                "conference_mode": session.conference_mode,
+                "reviewer_reviews": session.reviewer_reviews,
                 "total_questions": len(session.questions),
                 "questions": []
             }
@@ -1145,6 +1321,7 @@ class RebuttalService:
                 q_summary = {
                     "question_id": q.question_id,
                     "question_text": q.question_text,
+                    "reviewer_id": q.reviewer_id,
                     "revision_count": q.revision_count,
                     "is_satisfied": q.is_satisfied,
                     "final_strategy": q.agent7_output,
@@ -1167,7 +1344,13 @@ class RebuttalService:
         except Exception as e:
             print(f"[ERROR] Failed to save session summary: {e}")
     
-    def create_session(self, session_id: str, paper_path: str, review_path: str) -> SessionState:
+    def create_session(
+        self,
+        session_id: str,
+        paper_path: str,
+        review_path: str,
+        conference_mode: str = "generic",
+    ) -> SessionState:
 
         session_dir = os.path.join(SESSIONS_BASE_DIR, session_id)
         logs_dir = os.path.join(session_dir, "logs")
@@ -1181,10 +1364,15 @@ class RebuttalService:
 
         log_collector = LogCollector()
         
+        normalized_mode = (conference_mode or "generic").strip().lower()
+        if normalized_mode not in ("generic", "icml_openreview"):
+            normalized_mode = "generic"
+
         session = SessionState(
             session_id=session_id,
             paper_file_path=paper_path,
             review_file_path=review_path,
+            conference_mode=normalized_mode,
             session_dir=session_dir,
             logs_dir=logs_dir,
             arxiv_papers_dir=arxiv_papers_dir,
@@ -1273,26 +1461,50 @@ class RebuttalService:
             session.paper_summary = agent1.run()
 
             update_progress("Agent2: Extracting review questions...")
-            agent2 = Agent2(session.paper_summary, session.review_file_path, log_dir=session.logs_dir)
-            questions_raw = agent2.run()
-            
-            update_progress("Agent2-Checker: Validating question extraction...")
-            checker = Agent2Checker(session.paper_summary, session.review_file_path, questions_raw, log_dir=session.logs_dir)
-            questions_checked = checker.run()
+            if session.conference_mode == "icml_openreview":
+                agent2 = Agent2OpenReview(session.paper_summary, session.review_file_path, log_dir=session.logs_dir)
+                questions_raw = agent2.run()
 
-            update_progress("Parsing question list...")
-            questions, num = extract_review_questions(questions_checked)
-            
-            if not questions:
+                update_progress("Agent2-Checker: Validating OpenReview extraction...")
+                checker = Agent2OpenReviewChecker(
+                    session.paper_summary,
+                    session.review_file_path,
+                    questions_raw,
+                    log_dir=session.logs_dir,
+                )
+                questions_checked = checker.run()
+
+                update_progress("Parsing OpenReview JSON...")
+                reviewer_reviews, question_pairs = extract_openreview_reviews(questions_checked)
+                session.reviewer_reviews = reviewer_reviews
+                session.questions = [
+                    QuestionState(question_id=i + 1, reviewer_id=rid, question_text=q)
+                    for i, (rid, q) in enumerate(question_pairs)
+                ]
+            else:
+                agent2 = Agent2(session.paper_summary, session.review_file_path, log_dir=session.logs_dir)
+                questions_raw = agent2.run()
+
+                update_progress("Agent2-Checker: Validating question extraction...")
+                checker = Agent2Checker(session.paper_summary, session.review_file_path, questions_raw, log_dir=session.logs_dir)
+                questions_checked = checker.run()
+
+                update_progress("Parsing question list...")
+                questions, _ = extract_review_questions(questions_checked)
+
+                if not questions:
+                    raise RuntimeError("Failed to extract questions from Review")
+
+                session.questions = [
+                    QuestionState(question_id=i + 1, question_text=q)
+                    for i, q in enumerate(questions)
+                ]
+
+            if not session.questions:
                 raise RuntimeError("Failed to extract questions from Review")
-
-            session.questions = [
-                QuestionState(question_id=i+1, question_text=q)
-                for i, q in enumerate(questions)
-            ]
             session.current_question_idx = 0
             
-            update_progress(f"Analysis complete! Extracted {len(questions)} questions.")
+            update_progress(f"Analysis complete! Extracted {len(session.questions)} questions.")
             
             # Save session summary after initial analysis to persist paper_summary and questions
             self._save_session_summary(session_id)
@@ -1678,5 +1890,227 @@ class RebuttalService:
             raise
         
         return session.final_rebuttal
+
+    def _rewrite_openreview_for_compliance(self, draft: str, violations_text: str) -> str:
+        instructions = load_prompt("icml_openreview_compliance_rewriter.yaml")
+        model_input = (
+            f"{instructions}"
+            f"[violations]\n{violations_text}\n\n"
+            f"[draft]\n{draft}\n"
+        )
+        final_text, _ = get_llm_client().generate(
+            instructions="Be rigorous.",
+            input_text=model_input,
+            enable_reasoning=True,
+            temperature=0.2,
+            agent_name="OpenReview_compliance_rewriter",
+        )
+        return final_text or ""
+
+    def _compress_openreview_to_limit(self, draft: str, limit: int, must_keep_points: str) -> str:
+        instructions = load_prompt("icml_openreview_compressor.yaml")
+        model_input = (
+            f"{instructions}"
+            f"[char_limit]\n{limit}\n\n"
+            f"[must_keep_points]\n{must_keep_points}\n\n"
+            f"[draft]\n{draft}\n"
+        )
+        final_text, _ = get_llm_client().generate(
+            instructions="Be rigorous.",
+            input_text=model_input,
+            enable_reasoning=True,
+            temperature=0.2,
+            agent_name="OpenReview_compressor",
+        )
+        return final_text or ""
+
+    def generate_openreview_rebuttals(
+        self,
+        session_id: str,
+        progress_callback: Optional[Callable[[str], None]] = None,
+        char_limit: int = 5000,
+    ) -> Dict[str, str]:
+        session = self.get_session(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+        if session.conference_mode != "icml_openreview":
+            raise ValueError("Session is not in ICML/OpenReview mode")
+
+        def update_progress(msg: str):
+            session.progress_message = msg
+            if progress_callback:
+                progress_callback(msg)
+            print(f"[OpenReview] {msg}")
+
+        unsatisfied = [q for q in session.questions if not q.is_satisfied]
+        if unsatisfied:
+            raise RuntimeError(f"{len(unsatisfied)} questions not yet confirmed as satisfied")
+
+        # Group questions by reviewer_id.
+        by_reviewer: Dict[str, List[QuestionState]] = {}
+        for q in session.questions:
+            rid = (q.reviewer_id or "R?").strip() or "R?"
+            by_reviewer.setdefault(rid, []).append(q)
+
+        update_progress(f"Generating per-reviewer OpenReview responses ({len(by_reviewer)} reviewers)...")
+
+        original_context = session.paper_summary or _read_text(session.paper_file_path)
+        results: Dict[str, str] = {}
+        for rid, q_states in by_reviewer.items():
+            update_progress(f"Drafting response for {rid}...")
+
+            questions = [(qs.question_text or "").strip() for qs in q_states if (qs.question_text or "").strip()]
+            strategies_blocks = []
+            for i, qs in enumerate(q_states, start=1):
+                strategies_blocks.append(
+                    f"\n## Q{i}:\n```review_question\n{qs.question_text}\n```\n"
+                    f"\n[Rebuttal Strategy & To-Do List]:\n{qs.agent7_output}\n"
+                )
+            combined_strategies = "\n".join(strategies_blocks).strip()
+
+            raw_review = (session.reviewer_reviews.get(rid) or "").strip()
+
+            instructions = load_prompt("icml_openreview_rebuttal_writer.yaml")
+            model_input = (
+                f"{instructions}"
+                f"[original paper]\n```paper\n{original_context}\n```\n\n"
+                f"[reviewer id]\n{rid}\n\n"
+                f"[review original text]\n```review\n{raw_review}\n```\n\n"
+                f"[review questions]\n" + "\n".join([f"{idx+1}. {q}" for idx, q in enumerate(questions)]) + "\n\n"
+                f"[rebuttal strategies]\n```rebuttal\n{combined_strategies}\n```\n"
+            )
+
+            draft, _ = get_llm_client().generate(
+                instructions="Be rigorous.",
+                input_text=model_input,
+                enable_reasoning=True,
+                temperature=0.3,
+                agent_name=f"OpenReview_writer_{rid}",
+            )
+            text = apply_icml_tense_fixes(draft or "")
+
+            violations = scan_compliance_violations(text)
+            if violations:
+                update_progress(f"Rewriting for compliance for {rid}...")
+                violations_text = format_violations(violations)
+                rewritten = self._rewrite_openreview_for_compliance(text, violations_text)
+                text = apply_icml_tense_fixes(rewritten)
+                violations2 = scan_compliance_violations(text)
+                if violations2:
+                    raise RuntimeError(f"Compliance violations remain for {rid}:\n{format_violations(violations2)}")
+
+            must_keep = split_must_keep_points(questions)
+            budgeted = ensure_within_char_limit(
+                text,
+                char_limit,
+                compress=lambda d, lim: self._compress_openreview_to_limit(d, lim, must_keep),
+                max_attempts=3,
+            )
+            results[rid] = budgeted.text
+
+        # Persist both: per-reviewer json and a combined text for display.
+        session.final_openreview_rebuttals = results
+        combined_lines = ["# OpenReview Responses (ICML/OpenReview mode)", ""]
+        for rid, txt in results.items():
+            combined_lines.append(f"## {rid} (chars: {len(txt)})")
+            combined_lines.append(txt)
+            combined_lines.append("\n" + ("-" * 40) + "\n")
+        session.final_rebuttal = "\n".join(combined_lines).strip()
+
+        try:
+            with open(os.path.join(session.logs_dir, "openreview_rebuttals.json"), "w", encoding="utf-8") as f:
+                json.dump(results, f, ensure_ascii=False, indent=2)
+            with open(os.path.join(session.logs_dir, "final_rebuttal.txt"), "w", encoding="utf-8") as f:
+                f.write(session.final_rebuttal)
+        except Exception as e:
+            print(f"[OpenReview] Failed to write outputs: {e}")
+
+        session.overall_status = ProcessStatus.COMPLETED
+        update_progress("OpenReview rebuttals generation complete!")
+        return results
+
+    def generate_openreview_followup_reply(
+        self,
+        session_id: str,
+        reviewer_id: str,
+        reviewer_followup: str,
+        progress_callback: Optional[Callable[[str], None]] = None,
+        char_limit: int = 5000,
+    ) -> str:
+        session = self.get_session(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+        if session.conference_mode != "icml_openreview":
+            raise ValueError("Session is not in ICML/OpenReview mode")
+
+        rid = (reviewer_id or "R?").strip() or "R?"
+        followup_text = (reviewer_followup or "").strip()
+        if not followup_text:
+            raise ValueError("Reviewer follow-up is empty")
+
+        def update_progress(msg: str):
+            session.progress_message = msg
+            if progress_callback:
+                progress_callback(msg)
+            print(f"[OpenReview Follow-up] {msg}")
+
+        previous = (session.final_openreview_rebuttals.get(rid) or "").strip()
+        if not previous:
+            update_progress(f"No previous rebuttal found for {rid}, generating rebuttals first...")
+            self.generate_openreview_rebuttals(session_id, progress_callback=progress_callback, char_limit=char_limit)
+            previous = (self.get_session(session_id).final_openreview_rebuttals.get(rid) or "").strip()
+
+        update_progress(f"Drafting follow-up reply for {rid}...")
+        instructions = load_prompt("icml_openreview_followup_writer.yaml")
+        original_context = session.paper_summary or _read_text(session.paper_file_path)
+        model_input = (
+            f"{instructions}"
+            f"[reviewer id]\n{rid}\n\n"
+            f"[previous author response]\n```rebuttal\n{previous}\n```\n\n"
+            f"[reviewer follow-up]\n```review\n{followup_text}\n```\n\n"
+            f"[original paper]\n```paper\n{original_context}\n```\n"
+        )
+
+        draft, _ = get_llm_client().generate(
+            instructions="Be rigorous.",
+            input_text=model_input,
+            enable_reasoning=True,
+            temperature=0.3,
+            agent_name=f"OpenReview_followup_writer_{rid}",
+        )
+        text = apply_icml_tense_fixes(draft or "")
+
+        violations = scan_compliance_violations(text)
+        if violations:
+            update_progress(f"Rewriting follow-up for compliance for {rid}...")
+            rewritten = self._rewrite_openreview_for_compliance(text, format_violations(violations))
+            text = apply_icml_tense_fixes(rewritten)
+            violations2 = scan_compliance_violations(text)
+            if violations2:
+                raise RuntimeError(f"Compliance violations remain for follow-up {rid}:\n{format_violations(violations2)}")
+
+        followup_points = [ln.strip() for ln in followup_text.splitlines() if ln.strip()][:8]
+        if not followup_points:
+            followup_points = [followup_text[:200]]
+        must_keep = split_must_keep_points(followup_points)
+
+        budgeted = ensure_within_char_limit(
+            text,
+            char_limit,
+            compress=lambda d, lim: self._compress_openreview_to_limit(d, lim, must_keep),
+            max_attempts=3,
+        )
+
+        session.final_openreview_followups[rid] = budgeted.text
+        try:
+            with open(os.path.join(session.logs_dir, "openreview_followups.json"), "w", encoding="utf-8") as f:
+                json.dump(session.final_openreview_followups, f, ensure_ascii=False, indent=2)
+            with open(os.path.join(session.logs_dir, f"openreview_followup_{rid}.txt"), "w", encoding="utf-8") as f:
+                f.write(budgeted.text)
+        except Exception as e:
+            print(f"[OpenReview Follow-up] Failed to write outputs: {e}")
+
+        update_progress(f"Follow-up reply ready for {rid} (chars: {budgeted.chars})")
+        return budgeted.text
 
 rebuttal_service = RebuttalService()

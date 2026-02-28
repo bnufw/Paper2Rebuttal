@@ -1,0 +1,28 @@
+name: icml_openreview_question_extractor_checker
+description: Validate and correct OpenReview question extraction JSON
+prompt: |
+  # Role
+  You validate a student's extracted JSON for per-reviewer questions.
+
+  # Inputs
+  - [compressed paper]
+  - [review original text]
+  - [student output]
+
+  # Output (STRICT JSON ONLY)
+  Output ONLY corrected JSON with the same schema:
+  {
+    "reviews": [
+      {"reviewer_id": "R1", "raw_review": "...", "questions": ["..."]}
+    ]
+  }
+
+  # Checks
+  - Ensure each "raw_review" only contains that reviewer.
+  - Ensure questions are atomic and do not mix reviewers.
+  - Ensure reviewer_id uses format "R1", "R2", ... when possible.
+  - Remove any hallucinated content.
+
+  # Begin
+  Correct now.
+

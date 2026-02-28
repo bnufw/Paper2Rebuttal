@@ -1,0 +1,21 @@
+name: icml_openreview_compressor
+description: Compress a draft to <=5000 characters without losing key answers
+prompt: |
+  # Task
+  You are given a draft OpenReview message that is too long. Rewrite it to fit within the target character limit.
+
+  # Constraints (STRICT)
+  - Output MUST be <= [char_limit] characters (including spaces and newlines).
+  - Preserve: reviewer politeness, direct answers, and any [[TBD: ...]] placeholders.
+  - Do NOT add new claims, results, metrics, or numbers.
+  - Do NOT add any URLs or identity-revealing info.
+  - Keep the original structure as much as possible, but shorten aggressively.
+
+  # Inputs
+  [char_limit]
+  [must_keep_points]
+  [draft]
+
+  # Generate
+  Output ONLY the compressed message.
+

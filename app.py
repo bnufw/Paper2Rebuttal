@@ -210,7 +210,7 @@ def get_default_model_for_provider(provider: str) -> str:
     return list(models.keys())[0]
 
 
-def start_analysis(pdf_file, review_file, provider_choice, api_key, model_choice, custom_model):
+def start_analysis(pdf_file, review_file, provider_choice, api_key, model_choice, custom_model, conference_mode):
     if not pdf_file or not review_file:
         return (
             gr.update(),
@@ -260,7 +260,9 @@ def start_analysis(pdf_file, review_file, provider_choice, api_key, model_choice
     try:
         init_llm_client(api_key=api_key.strip(), provider=provider_key, model=selected_model)
         pdf_path, review_path, _ = save_uploaded_files(pdf_file, review_file, session_id)
-        session = rebuttal_service.create_session(session_id, pdf_path, review_path)
+        mode = (conference_mode or "Generic").strip().lower()
+        normalized_mode = "icml_openreview" if "icml" in mode else "generic"
+        session = rebuttal_service.create_session(session_id, pdf_path, review_path, conference_mode=normalized_mode)
         
         return (
             gr.update(visible=False),
@@ -439,6 +441,50 @@ def generate_strategy_summary(session) -> str:
     return "\n".join(lines)
 
 
+def _list_reviewer_ids_for_session(session_id: str) -> List[str]:
+    session = rebuttal_service.get_session(session_id)
+    if not session:
+        return []
+    if getattr(session, "final_openreview_rebuttals", None):
+        return sorted(session.final_openreview_rebuttals.keys())
+    ids = set()
+    for q in getattr(session, "questions", []) or []:
+        rid = (getattr(q, "reviewer_id", "") or "").strip()
+        if rid:
+            ids.add(rid)
+    if getattr(session, "reviewer_reviews", None):
+        ids.update(session.reviewer_reviews.keys())
+    return sorted(ids) if ids else []
+
+
+def generate_followup_reply(session_state, reviewer_id, reviewer_followup):
+    if not session_state:
+        return gr.update(), gr.update(value=""), gr.update(value=""), "❌ Session state lost"
+
+    session_id = session_state.get("session_id")
+    if not session_id:
+        return gr.update(), gr.update(value=""), gr.update(value=""), "❌ Session id missing"
+
+    reviewer_ids = _list_reviewer_ids_for_session(session_id)
+    dropdown_update = gr.update(choices=reviewer_ids, value=reviewer_id if reviewer_id in reviewer_ids else (reviewer_ids[0] if reviewer_ids else None))
+
+    try:
+        session = rebuttal_service.get_session(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+        if getattr(session, "conference_mode", "generic") != "icml_openreview":
+            return dropdown_update, gr.update(value=""), gr.update(value=""), "⚠️ Follow-up reply is only available in ICML/OpenReview mode."
+
+        rid = (reviewer_id or "").strip()
+        if not rid:
+            return dropdown_update, gr.update(value=""), gr.update(value=""), "⚠️ Please select a reviewer id."
+
+        text = rebuttal_service.generate_openreview_followup_reply(session_id, rid, reviewer_followup)
+        return dropdown_update, gr.update(value=text), gr.update(value=text), f"✅ Generated follow-up for {rid} (chars: {len(text)})"
+    except Exception as e:
+        return dropdown_update, gr.update(value=""), gr.update(value=""), f"❌ Failed: {str(e)}"
+
+
 def skip_question(session_state):
     if not session_state:
         return (
@@ -493,7 +539,13 @@ def skip_question(session_state):
             )
         else:
             strategy_summary = generate_strategy_summary(session)
-            final_text = rebuttal_service.generate_final_rebuttal(session_id)
+            if getattr(session, "conference_mode", "generic") == "icml_openreview":
+                if not session.final_rebuttal:
+                    rebuttal_service.generate_openreview_rebuttals(session_id)
+                    session = rebuttal_service.get_session(session_id)
+                final_text = session.final_rebuttal
+            else:
+                final_text = rebuttal_service.generate_final_rebuttal(session_id)
             
             return (
                 gr.update(visible=False),
@@ -574,7 +626,12 @@ def confirm_and_next(strategy_text, session_state):
             )
         else:
             strategy_summary = generate_strategy_summary(session)
-            final_text = rebuttal_service.generate_final_rebuttal(session_id)
+            if getattr(session, "conference_mode", "generic") == "icml_openreview":
+                rebuttal_service.generate_openreview_rebuttals(session_id)
+                session = rebuttal_service.get_session(session_id)
+                final_text = session.final_rebuttal
+            else:
+                final_text = rebuttal_service.generate_final_rebuttal(session_id)
             
             return (
                 gr.update(visible=False),
@@ -706,7 +763,14 @@ def resume_session(session_id_to_resume, provider_choice, api_key):
         # If all questions are satisfied, go to result page
         if resume_idx >= len(session.questions):
             strategy_summary = generate_strategy_summary(session)
-            final_text = session.final_rebuttal or rebuttal_service.generate_final_rebuttal(session_id_to_resume)
+            if getattr(session, "conference_mode", "generic") == "icml_openreview":
+                if session.final_rebuttal:
+                    final_text = session.final_rebuttal
+                else:
+                    rebuttal_service.generate_openreview_rebuttals(session_id_to_resume)
+                    final_text = rebuttal_service.get_session(session_id_to_resume).final_rebuttal
+            else:
+                final_text = session.final_rebuttal or rebuttal_service.generate_final_rebuttal(session_id_to_resume)
             
             return (
                 gr.update(visible=False),
@@ -1035,6 +1099,15 @@ with gr.Blocks(title="AI Rebuttal Assistant") as demo:
             )
         
         gr.Markdown("---")
+
+        with gr.Group():
+            gr.Markdown("### 🧾 Response Format")
+            conference_mode_choice = gr.Dropdown(
+                label="Mode",
+                choices=["Generic", "ICML/OpenReview"],
+                value="Generic",
+                info="ICML/OpenReview: per-reviewer outputs intended for OpenReview (5000 characters limit).",
+            )
         
         gr.Markdown("### 📄 Upload Files")
         with gr.Row():
@@ -1212,9 +1285,10 @@ with gr.Blocks(title="AI Rebuttal Assistant") as demo:
         
         gr.Markdown(
             """
-            ⚠️ **IMPORTANT NOTICE:** The Final Reference Rebuttal contains **LLM-estimated numerical values marked with asterisks (*)**. 
-            These estimated values are placeholders and **MUST be replaced with actual experimental results**.
-            Please carefully review and verify all data.
+            ⚠️ **IMPORTANT NOTICE:** The generated text may contain placeholders that require author verification.
+            - In Generic mode, some drafts may include asterisks `(*)` as placeholders for missing empirical results.
+            - In ICML/OpenReview mode, missing evidence MUST be written as `[[TBD: ...]]` placeholders (no fabricated numbers).
+            Please carefully review and replace placeholders with real evidence before submission.
             """,
             elem_classes=["important-warning"]
         )
@@ -1237,8 +1311,7 @@ with gr.Blocks(title="AI Rebuttal Assistant") as demo:
                     """
                     *The complete reference rebuttal document.*
                     
-                    > ⚠️ **Note:** Numerical values marked with **asterisks (*)** are LLM-estimated placeholders.
-                    > You **MUST supplement these with actual experimental data** .
+                    > ⚠️ **Note:** This content may include placeholders (`(*)` or `[[TBD: ...]]`) that must be replaced with real evidence.
                     """
                 )
                 with gr.Tabs():
@@ -1250,6 +1323,35 @@ with gr.Blocks(title="AI Rebuttal Assistant") as demo:
                             lines=20,
                             max_lines=40,
                         )
+
+            with gr.TabItem("💬 Follow-up Reply (ICML/OpenReview)"):
+                gr.Markdown("*Generate a short follow-up reply for OpenReview discussion rounds (<= 5000 characters).*")
+                followup_status = gr.Markdown("")
+                with gr.Row():
+                    followup_reviewer_choice = gr.Dropdown(
+                        label="Reviewer ID",
+                        choices=[],
+                        value=None,
+                        info="If empty, generate the final rebuttal first, then click Generate here to populate reviewer IDs.",
+                        scale=1,
+                    )
+                    followup_generate_btn = gr.Button("🧾 Generate Follow-up Reply", variant="primary", scale=1)
+                followup_input = gr.Textbox(
+                    label="Reviewer Follow-up (paste here)",
+                    lines=8,
+                    placeholder="Paste the reviewer's follow-up comment for this reviewer.",
+                )
+                with gr.Tabs():
+                    with gr.TabItem("📖 Preview"):
+                        followup_preview = gr.Markdown(elem_classes=["strategy-preview"])
+                    with gr.TabItem("✏️ Raw Text"):
+                        followup_output = gr.Textbox(label="Follow-up Reply", lines=16, max_lines=40)
+
+                followup_generate_btn.click(
+                    fn=generate_followup_reply,
+                    inputs=[session_state, followup_reviewer_choice, followup_input],
+                    outputs=[followup_reviewer_choice, followup_preview, followup_output, followup_status],
+                )
         
         gr.Markdown("---")
         gr.Markdown("### 📥 Download Files")
@@ -1283,7 +1385,7 @@ with gr.Blocks(title="AI Rebuttal Assistant") as demo:
     
     start_btn.click(
         fn=start_analysis,
-        inputs=[pdf_input, review_input, provider_choice, api_key_input, model_choice, custom_model_input],
+        inputs=[pdf_input, review_input, provider_choice, api_key_input, model_choice, custom_model_input, conference_mode_choice],
         outputs=[
             upload_col, loading_col, interact_col, result_col,
             session_state, upload_status, log_timer,

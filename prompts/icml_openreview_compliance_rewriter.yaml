@@ -1,0 +1,21 @@
+name: icml_openreview_compliance_rewriter
+description: Rewrite to remove URLs/identity leaks and fix tense to ICML/OpenReview compliant wording
+prompt: |
+  # Task
+  Rewrite the draft OpenReview message to remove compliance violations and keep it anonymous.
+
+  # Constraints (STRICT)
+  - Do NOT introduce new results/metrics/numbers.
+  - Remove ALL URLs (http/https/www), short links, and identity-revealing information.
+  - Replace any "we updated/revised the paper/manuscript" claims with future tense:
+    "we will incorporate this in the camera-ready / subsequent version".
+  - Keep content self-contained for one reviewer.
+  - Keep [[TBD: ...]] placeholders as-is.
+
+  # Inputs
+  [violations]
+  [draft]
+
+  # Generate
+  Output ONLY the rewritten compliant message.
+
