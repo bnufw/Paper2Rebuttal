@@ -31,3 +31,4 @@ arxiv_papers/
 arxiv_papers_md/
 sessions/
 run_gradio_*
+.codex
