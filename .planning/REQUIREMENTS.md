@@ -68,36 +68,36 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| INPT-01 | TBD | Pending |
-| INPT-02 | TBD | Pending |
-| INPT-03 | TBD | Pending |
-| INPT-04 | TBD | Pending |
-| EXPT-01 | TBD | Pending |
-| EXPT-02 | TBD | Pending |
-| EXPT-03 | TBD | Pending |
-| EXPT-04 | TBD | Pending |
-| EXPT-05 | TBD | Pending |
-| COMP-01 | TBD | Pending |
-| COMP-02 | TBD | Pending |
-| COMP-03 | TBD | Pending |
-| RBTL-01 | TBD | Pending |
-| RBTL-02 | TBD | Pending |
-| RBTL-03 | TBD | Pending |
-| RBTL-04 | TBD | Pending |
-| RBTL-05 | TBD | Pending |
-| FLOW-01 | TBD | Pending |
-| FLOW-02 | TBD | Pending |
-| FLOW-03 | TBD | Pending |
-| FLOW-04 | TBD | Pending |
-| SAFE-01 | TBD | Pending |
-| SAFE-02 | TBD | Pending |
-| SAFE-03 | TBD | Pending |
+| INPT-01 | Phase 1 | Pending |
+| INPT-02 | Phase 1 | Pending |
+| INPT-03 | Phase 2 | Pending |
+| INPT-04 | Phase 1 | Pending |
+| EXPT-01 | Phase 2 | Pending |
+| EXPT-02 | Phase 2 | Pending |
+| EXPT-03 | Phase 2 | Pending |
+| EXPT-04 | Phase 2 | Pending |
+| EXPT-05 | Phase 2 | Pending |
+| COMP-01 | Phase 2 | Pending |
+| COMP-02 | Phase 2 | Pending |
+| COMP-03 | Phase 2 | Pending |
+| RBTL-01 | Phase 2 | Pending |
+| RBTL-02 | Phase 3 | Pending |
+| RBTL-03 | Phase 3 | Pending |
+| RBTL-04 | Phase 2 | Pending |
+| RBTL-05 | Phase 3 | Pending |
+| FLOW-01 | Phase 3 | Pending |
+| FLOW-02 | Phase 2 | Pending |
+| FLOW-03 | Phase 1 | Pending |
+| FLOW-04 | Phase 2 | Pending |
+| SAFE-01 | Phase 3 | Pending |
+| SAFE-02 | Phase 3 | Pending |
+| SAFE-03 | Phase 3 | Pending |
 
 **Coverage:**
 - v1 requirements: 24 total
-- Mapped to phases: 0
-- Unmapped: 24 ⚠️
+- Mapped to phases: 24
+- Unmapped: 0 ✅
 
 ---
 *Requirements defined: 2026-03-03*  
-*Last updated: 2026-03-03 after initial definition*
+*Last updated: 2026-03-03 after roadmap revision to 3 phases*
