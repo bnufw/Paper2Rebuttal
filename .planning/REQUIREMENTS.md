@@ -66,30 +66,30 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| RVW-01 | TBD | Pending |
-| RVW-02 | TBD | Pending |
-| RVW-03 | TBD | Pending |
-| RVW-04 | TBD | Pending |
-| EXP-01 | TBD | Pending |
-| EXP-02 | TBD | Pending |
-| EXP-03 | TBD | Pending |
-| EXP-04 | TBD | Pending |
-| PRS-01 | TBD | Pending |
-| PRS-02 | TBD | Pending |
-| PRS-03 | TBD | Pending |
-| PRS-04 | TBD | Pending |
-| CMP-01 | TBD | Pending |
-| CMP-02 | TBD | Pending |
-| CMP-03 | TBD | Pending |
-| CMP-04 | TBD | Pending |
-| LOG-01 | TBD | Pending |
-| LOG-02 | TBD | Pending |
-| LOG-03 | TBD | Pending |
+| RVW-01 | Phase 1 | Pending |
+| RVW-02 | Phase 1 | Pending |
+| RVW-03 | Phase 2 | Pending |
+| RVW-04 | Phase 2 | Pending |
+| EXP-01 | Phase 3 | Pending |
+| EXP-02 | Phase 3 | Pending |
+| EXP-03 | Phase 3 | Pending |
+| EXP-04 | Phase 3 | Pending |
+| PRS-01 | Phase 2 | Pending |
+| PRS-02 | Phase 2 | Pending |
+| PRS-03 | Phase 2 | Pending |
+| PRS-04 | Phase 2 | Pending |
+| CMP-01 | Phase 4 | Pending |
+| CMP-02 | Phase 4 | Pending |
+| CMP-03 | Phase 4 | Pending |
+| CMP-04 | Phase 4 | Pending |
+| LOG-01 | Phase 5 | Pending |
+| LOG-02 | Phase 5 | Pending |
+| LOG-03 | Phase 5 | Pending |
 
 **Coverage:**
 - v1 requirements: 19 total
-- Mapped to phases: 0
-- Unmapped: 19 ⚠️
+- Mapped to phases: 19
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-03-03*  
