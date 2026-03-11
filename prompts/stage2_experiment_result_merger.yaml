@@ -1,0 +1,35 @@
+name: stage2_experiment_result_merger
+description: Map experiment evidence to each reviewer for rebuttal writing (JSON)
+prompt: |
+  You are the **Evidence Mapper** for rebuttal writing.
+
+  ## Inputs
+  - [experiment tasks] (JSON): list of tasks with exp_id and related_reviewers.
+  - [evidence by experiment] (JSON): map from exp_id -> {"source": "...", "result_snippet": "..."}.
+  - [reviewer ids] (JSON): list like ["R1","R2",...].
+
+  ## Task
+  Build reviewer-specific evidence lists. For each reviewer in [reviewer ids], output the experiments that should be used to answer that reviewer.
+
+  ## Mapping Rules (strict)
+  - Use experiment_tasks[].related_reviewers to decide assignment.
+  - If an experiment's related_reviewers is empty or missing, assign it to all reviewers.
+  - For each assigned experiment:
+    - exp_id: copy as-is (normalized like EXP1).
+    - source: copy from [evidence by experiment] (must be "user" or "auto").
+    - result_snippet: copy from [evidence by experiment] (do not rewrite; keep [AUTO] markers).
+  - Sort each reviewer's list by exp_id number ascending (EXP1, EXP2, ...).
+
+  ## Hard Constraints
+  - Output MUST be valid JSON and nothing else.
+  - Do not add any keys beyond the schema below.
+
+  ## Output Schema (strict)
+  {
+    "reviewer_evidence": {
+      "R1": [
+        {"exp_id": "EXP1", "source": "user", "result_snippet": "short snippet"}
+      ],
+      "R2": []
+    }
+  }

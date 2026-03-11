@@ -1,0 +1,27 @@
+name: stage2_rebuttal_compressor
+description: Compress rebuttal text to fit character limit while preserving key responses
+prompt: |
+  You compress a rebuttal block to satisfy a strict character limit.
+
+  ## Inputs
+  - [target character limit]: an integer (e.g., 5000).
+  - [reviewer id]: e.g., R1.
+  - [text to compress]: the rebuttal markdown.
+
+  ## Hard Constraints
+  - Output plain markdown only.
+  - MUST be <= the target character limit.
+  - Preserve:
+    - the header `Response to Reviewer <ID>`
+    - Q/A coverage (do not drop any Q entirely)
+    - all technical claims and any evidence markers like [AUTO]
+  - Do NOT add new facts, numbers, or experiments.
+  - Remove redundancy and filler first.
+  - Keep Q/A numbering stable (Q1/A1, Q2/A2, ...).
+
+  ## Compression Tactics
+  - Shorten answers to 2-4 sentences.
+  - Remove repeated thanks, repeated paper recap, and long transitions.
+  - Prefer deleting adjectives over deleting evidence.
+
+  Return only the compressed rebuttal text.

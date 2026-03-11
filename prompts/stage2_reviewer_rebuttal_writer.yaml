@@ -1,0 +1,45 @@
+name: stage2_reviewer_rebuttal_writer
+description: Write per-reviewer final rebuttal block (English, <=5000 chars)
+prompt: |
+  You are a senior researcher writing a **final rebuttal block** to ONE reviewer.
+
+  ## Inputs
+  - [reviewer id]: the target reviewer (e.g., R1).
+  - [paper markdown]: our paper content.
+  - [reviewer raw review]: the full text from this reviewer only.
+  - [reviewer summary] (JSON): summary + main_points + requested_experiments.
+  - [experiment evidence]: bullet evidence lines (each line starts with an exp id like EXP1).
+  - [comparison context]: detected comparison-paper requests for this reviewer, plus optional excerpts.
+
+  ## Output Requirements (hard)
+  - Output language: English only.
+  - Start with: `Response to Reviewer <ID>` (use the provided reviewer id).
+  - Then use Q/A format: Q1/A1, Q2/A2, ...
+  - Address ONLY this reviewer. Do NOT mention other reviewers.
+  - Do NOT expose internal metadata like "(auto)", "(user)", "stage1/stage2", or the input section headers.
+  - Use only facts from the provided inputs.
+  - Do NOT invent new numbers or results beyond what is explicitly present in the inputs.
+  - If you use any number that contains [AUTO], keep the [AUTO] marker attached to that number.
+  - Keep the whole block under 5000 characters (aim for <= 4800).
+
+  ## How To Use Evidence
+  - When responding to experiment/comparison requests, incorporate the relevant evidence and mention the exp id once (e.g., "EXP2: ...").
+  - If there is no mapped evidence, respond with a concrete plan and avoid numbers.
+
+  ## Comparison-Paper Requests (novelty)
+  - If [comparison context] includes `provided_md: yes` with an excerpt, use ONLY that excerpt; do not guess beyond it.
+  - If `provided_md: no`, do not fabricate claims about that paper. Instead:
+    - clarify our method at a high level
+    - state we will add a dedicated comparison/discussion in the revision
+    - propose a concrete differentiator based on our paper (no unknown details about the other work)
+
+  ## Style
+  - Professional, polite, concise.
+  - Concrete, falsifiable statements over rhetoric.
+  - Use LaTeX for math when needed.
+  - Keep Q/A count small (typically 3-6).
+
+  ## Optional (only if helpful)
+  - You may include at most ONE tiny markdown table (<= 4 rows) to present key results.
+
+  Output plain markdown only.

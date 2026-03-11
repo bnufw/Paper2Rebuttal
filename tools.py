@@ -133,6 +133,286 @@ def pdf_to_md(pdf_path: str, output_path: str) -> str | None:
         import traceback
         traceback.print_exc()
         return None
+
+
+def mistral_pdf_to_markdown(pdf_path: str, model: str = "mistral-ocr-latest") -> str:
+    api_key = (os.environ.get("MISTRAL_API_KEY") or "").strip()
+    if not api_key:
+        raise ValueError("Missing MISTRAL_API_KEY. Please set it in your environment before uploading a PDF.")
+
+    import base64
+    import requests
+
+    with open(pdf_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    payload = {
+        "model": model,
+        "document": {
+            "type": "document_url",
+            "document_url": f"data:application/pdf;base64,{b64}",
+        },
+        "include_image_base64": False,
+    }
+    resp = requests.post(
+        "https://api.mistral.ai/v1/ocr",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=600,
+    )
+    if not resp.ok:
+        raise ValueError(f"Mistral OCR failed: HTTP {resp.status_code}: {resp.text[:500]}")
+
+    data = resp.json() or {}
+    pages = data.get("pages") or []
+    if not isinstance(pages, list) or not pages:
+        raise ValueError("Mistral OCR returned no pages.")
+
+    def page_key(p: dict) -> int:
+        try:
+            return int(p.get("index", 0))
+        except Exception:
+            return 0
+
+    chunks = []
+    for p in sorted([x for x in pages if isinstance(x, dict)], key=page_key):
+        md = str(p.get("markdown", "") or "").strip()
+        if md:
+            chunks.append(md)
+    return "\n\n".join(chunks).strip()
+
+
+def strip_markdown_images(md_text: str) -> str:
+    text = md_text or ""
+    text = re.sub(r"!\[[^\]]*\]\([^\)]*\)", "", text)
+    text = re.sub(r"!\[[^\]]*\]\[[^\]]*\]", "", text)
+    text = re.sub(r"(?is)<img[^>]*>", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+
+def extract_paper_core_sections(md_text: str) -> str:
+    text = (md_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+
+    md_heading_re = re.compile(r"^(#{1,6})\s+(.*)\s*$")
+    num_heading_re = re.compile(r"^\s*(\d+(?:\.\d+)*)\s+([A-Za-z][A-Za-z0-9][A-Za-z0-9 \-:]{0,90})\s*$")
+
+    def norm_title(title: str) -> str:
+        t = (title or "").strip().lower()
+        t = re.sub(r"^\s*(\d+(?:\.\d+)*|[ivx]+)\s*[\.\:\-]?\s*", "", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
+
+    headings = []
+    for i, line in enumerate(lines):
+        m = md_heading_re.match(line)
+        if m:
+            level = len(m.group(1))
+            title = m.group(2).strip()
+            headings.append({"i": i, "level": level, "title": title})
+            continue
+
+        if line.strip().lower() == "abstract":
+            headings.append({"i": i, "level": 2, "title": "Abstract"})
+            continue
+
+        m = num_heading_re.match(line)
+        if m and len(line) <= 120 and not line.strip().endswith("."):
+            nums = m.group(1)
+            title = m.group(2).strip()
+            level = min(6, 2 + nums.count("."))
+            headings.append({"i": i, "level": level, "title": title})
+
+    if not headings:
+        return strip_markdown_images(text)
+
+    exclude_re = re.compile(r"\b(related\s*work|related\s*works|appendix|supplementary)\b", re.IGNORECASE)
+    method_re = re.compile(r"\b(method|methods|approach|methodology|model|architecture|framework|algorithm)\b", re.IGNORECASE)
+    exp_re = re.compile(r"\b(experiment|experiments|experimental|evaluation|results|ablation|benchmark|implementation|setup|dataset)\b", re.IGNORECASE)
+
+    def want(title_norm: str) -> bool:
+        if exclude_re.search(title_norm):
+            return False
+        if "abstract" in title_norm:
+            return True
+        if method_re.search(title_norm):
+            return True
+        if exp_re.search(title_norm):
+            return True
+        return False
+
+    kept_blocks = []
+    for idx, h in enumerate(headings):
+        start = h["i"]
+        level = h["level"]
+        end = len(lines)
+        for j in range(idx + 1, len(headings)):
+            if headings[j]["level"] <= level:
+                end = headings[j]["i"]
+                break
+
+        title_norm = norm_title(h["title"])
+        if not want(title_norm):
+            continue
+        block = "\n".join(lines[start:end]).strip()
+        if block:
+            kept_blocks.append(block)
+
+    if not kept_blocks:
+        return strip_markdown_images(text)
+
+    out = "# Paper (Abstract/Methods/Experiments)\n\n" + "\n\n".join(kept_blocks)
+    return strip_markdown_images(out)
+
+
+def convert_pdf_to_core_markdown_mistral(pdf_path: str) -> str:
+    return extract_paper_core_sections(mistral_pdf_to_markdown(pdf_path))
+
+
+def openreview_forum_url_to_id(openreview_url: str) -> str:
+    from urllib.parse import parse_qs, urlparse
+
+    u = urlparse((openreview_url or "").strip())
+    qs = parse_qs(u.query or "")
+    forum_id = (qs.get("id", [""]) or [""])[0].strip() or (qs.get("forum", [""]) or [""])[0].strip()
+    if not forum_id:
+        raise ValueError("OpenReview link missing forum id (expected ?id=... or ?forum=...).")
+    return forum_id
+
+
+def fetch_openreview_reviews_markdown(openreview_url: str) -> str:
+    try:
+        import openreview
+    except Exception as e:
+        raise ValueError(f"openreview-py is not installed or failed to import: {type(e).__name__}: {e}")
+
+    baseurl = (os.environ.get("OPENREVIEW_BASEURL") or "https://api2.openreview.net").strip()
+    username = (os.environ.get("OPENREVIEW_USERNAME") or "").strip()
+    password = (os.environ.get("OPENREVIEW_PASSWORD") or "").strip()
+
+    forum_id = openreview_forum_url_to_id(openreview_url)
+
+    kwargs = {"baseurl": baseurl}
+    if username and password:
+        kwargs.update({"username": username, "password": password})
+    client = openreview.api.OpenReviewClient(**kwargs)
+    notes = client.get_all_notes(forum=forum_id) or []
+
+    def get_attr(obj, key, default=None):
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    def note_time(n) -> int:
+        for k in ("tcdate", "cdate", "tmdate", "mdate"):
+            v = get_attr(n, k, None)
+            if isinstance(v, (int, float)):
+                return int(v)
+        return 0
+
+    def invitation(n) -> str:
+        return str(get_attr(n, "invitation", "") or "")
+
+    def signature(n) -> str:
+        sigs = get_attr(n, "signatures", None) or []
+        if isinstance(sigs, list) and sigs:
+            return str(sigs[0] or "")
+        return str(get_attr(n, "id", "") or "")
+
+    official_by_sig = {}
+    meta_notes = []
+    for n in notes:
+        inv = invitation(n).lower()
+        if "official_review" in inv:
+            sig = signature(n) or str(get_attr(n, "id", "") or "")
+            prev = official_by_sig.get(sig)
+            if (prev is None) or (note_time(n) >= note_time(prev)):
+                official_by_sig[sig] = n
+        elif "meta_review" in inv:
+            meta_notes.append(n)
+
+    def unwrap(v):
+        if isinstance(v, dict) and "value" in v:
+            return v.get("value")
+        return v
+
+    preferred_keys = ["rating", "confidence", "summary", "strengths", "weaknesses", "questions", "review"]
+
+    def format_note_content(n) -> str:
+        content = get_attr(n, "content", {}) or {}
+        if not isinstance(content, dict):
+            return str(content).strip()
+
+        lines = []
+        seen = set()
+
+        def add_key(k: str) -> None:
+            nonlocal lines
+            if k in seen:
+                return
+            seen.add(k)
+            raw = content.get(k)
+            val = unwrap(raw)
+            if val is None:
+                return
+            s = str(val).strip()
+            if not s:
+                return
+            lines.append(f"### {k}\n{s}")
+
+        for k in preferred_keys:
+            add_key(k)
+        for k in sorted([x for x in content.keys() if x not in seen]):
+            add_key(k)
+
+        return "\n\n".join(lines).strip()
+
+    reviewer_nums = {}
+    used = set()
+    reviewer_re = re.compile(r"reviewer[_\s-]*(\d+)", re.IGNORECASE)
+    for sig in sorted(official_by_sig.keys()):
+        m = reviewer_re.search(sig)
+        if m:
+            num = int(m.group(1))
+            reviewer_nums[sig] = num
+            used.add(num)
+
+    next_num = 1
+    for sig in sorted(official_by_sig.keys()):
+        if sig in reviewer_nums:
+            continue
+        while next_num in used:
+            next_num += 1
+        reviewer_nums[sig] = next_num
+        used.add(next_num)
+        next_num += 1
+
+    md_lines = ["# Reviews (OpenReview)", ""]
+
+    for sig, n in sorted(official_by_sig.items(), key=lambda kv: reviewer_nums.get(kv[0], 10**9)):
+        num = reviewer_nums.get(sig, 1)
+        md_lines.append(f"## Reviewer {num}")
+        body = format_note_content(n)
+        md_lines.append(body if body else "(empty)")
+        md_lines.append("")
+
+    if meta_notes:
+        meta_notes = sorted(meta_notes, key=note_time)
+        merged = []
+        for n in meta_notes:
+            body = format_note_content(n)
+            if body:
+                merged.append(body)
+        if merged:
+            md_lines.append("## Reviewer 0 (Meta Review)")
+            md_lines.append("\n\n---\n\n".join(merged))
+            md_lines.append("")
+
+    out = "\n".join(md_lines).strip()
+    if len(out) < 20:
+        raise ValueError("No Official_Review/Meta_Review notes found for this forum.")
+    return out + "\n"
 def _safe_filename(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*]+', '_', name)[:100]
 

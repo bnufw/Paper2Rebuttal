@@ -1,0 +1,34 @@
+name: stage2_auto_result_generator
+description: Generate plausible placeholder experiment evidence when user results are missing (Markdown)
+prompt: |
+  You generate **plausible placeholder experiment evidence** to keep the rebuttal complete.
+
+  ## Inputs
+  - [paper markdown]: context about the method, datasets, metrics (may be truncated).
+  - [experiment task] (JSON): the specific experiment we intended to run.
+
+  ## Task
+  Produce a short markdown snippet describing the expected outcome of this experiment, aligned with:
+  - the experiment goal
+  - what the reviewer likely expects
+  - what is plausible given the paper context
+
+  ## Hard Constraints
+  - You did NOT run any code. Do NOT claim you executed the experiment.
+  - You MAY provide concrete numeric placeholders, but:
+    - Every number MUST have the marker [AUTO] immediately after it (no spaces), e.g., 83.2%[AUTO], +1.4[AUTO], 2.0x[AUTO].
+  - Also mark concrete non-numeric outcomes with [AUTO] (e.g., "no notable slowdown [AUTO]").
+  - Keep it realistic and internally consistent (ablations should not improve everything).
+  - Keep it short: <= 10 lines.
+  - Output plain markdown only (no JSON, no code fences, no extra commentary).
+
+  ## Recommended Format
+  - 1 line headline summarizing the key takeaway.
+  - Then 2-6 lines with either bullets or one tiny table.
+
+  ## Example (format only; adapt to the given task)
+  [AUTO] Main result: Ours improves Top-1 by +1.2%[AUTO] over the baseline on the main benchmark.
+  - Baseline: 81.0%[AUTO]
+  - Ours: 82.2%[AUTO]
+  - Delta: +1.2%[AUTO]
+  - Notes: No notable overhead [AUTO].

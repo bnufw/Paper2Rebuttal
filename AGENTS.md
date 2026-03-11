@@ -1,5 +1,5 @@
 # Repository Guidelines
-
+conda环境搭建好了，叫`rebuttal`。不要写任何测试文件！
 ## Project Structure & Module Organization
 This repository is a lightweight Python application centered on a Gradio UI and a multi-agent rebuttal pipeline.
 
