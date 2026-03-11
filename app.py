@@ -549,7 +549,7 @@ APP_CSS = """
 """
 
 
-with gr.Blocks(title="Paper2Rebuttal Personal", css=APP_CSS) as demo:
+with gr.Blocks(title="Paper2Rebuttal Personal") as demo:
     session_state = gr.State(None)
 
     gr.Markdown(
@@ -738,4 +738,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     print(f"Starting app on http://{args.host}:{args.port}")
-    demo.launch(server_name=args.host, server_port=args.port, share=args.share, theme=gr.themes.Soft())
+    demo.launch(
+        server_name=args.host,
+        server_port=args.port,
+        share=args.share,
+        theme=gr.themes.Soft(),
+        css=APP_CSS,
+    )
