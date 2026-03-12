@@ -120,7 +120,7 @@ class RebuttalService:
             comparison_paths=comparison_paths,
         )
 
-        if paper_path and os.path.exists(paper_path):
+        if paper_path and os.path.exists(paper_path) and not str(paper_path).lower().endswith(".pdf"):
             session.paper_md = self._read_text_safe(paper_path)
         if review_path and os.path.exists(review_path):
             session.review_md = self._read_text_safe(review_path)
@@ -179,14 +179,77 @@ class RebuttalService:
     def count_chars(self, text: str) -> int:
         return len(text or "")
 
+    def _paper_is_pdf(self, session: SessionState) -> bool:
+        return str(session.paper_path or "").lower().endswith(".pdf")
+
+    def _ensure_paper_loaded(self, session: SessionState) -> None:
+        if self._paper_is_pdf(session):
+            session.paper_md = ""
+            return
+        if session.paper_path:
+            session.paper_md = self._read_text_safe(session.paper_path)
+
+    def _build_paper_prompt_context(
+        self,
+        session: SessionState,
+        char_limit: Optional[int] = None,
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        if self._paper_is_pdf(session):
+            client = get_llm_client()
+            if client.provider != "gemini":
+                raise ValueError("This session uses a PDF paper. Please use Gemini for this session.")
+            if not client.supports_pdf_attachments():
+                raise ValueError("Native Gemini PDF input requires the google.genai backend.")
+
+            pdf_bytes = self._read_binary_safe(session.paper_path)
+            if not pdf_bytes:
+                raise ValueError("Paper PDF is empty.")
+
+            context_text = (
+                "[paper content]\n"
+                "The paper is attached as PDF.\n"
+                "Use the attached paper PDF. Focus on abstract, method, and experiments. "
+                "Ignore related work and appendix unless necessary."
+            )
+            attachments = [
+                {
+                    "type": "bytes",
+                    "mime_type": "application/pdf",
+                    "data": pdf_bytes,
+                    "name": os.path.basename(session.paper_path),
+                }
+            ]
+            return context_text, attachments
+
+        self._ensure_paper_loaded(session)
+        if not session.paper_md.strip():
+            raise ValueError("Paper markdown is empty.")
+
+        paper_text = session.paper_md[:char_limit] if char_limit else session.paper_md
+        return f"[paper content]\n```md\n{paper_text}\n```", []
+
+    def _attachment_log_lines(self, attachments: Optional[List[Dict[str, Any]]]) -> List[str]:
+        lines: List[str] = []
+        for idx, attachment in enumerate(attachments or [], start=1):
+            data = attachment.get("data")
+            size = len(data) if isinstance(data, (bytes, bytearray)) else 0
+            lines.append(
+                "ATTACHMENT_{}: type={} mime_type={} name={} bytes={}".format(
+                    idx,
+                    attachment.get("type", ""),
+                    attachment.get("mime_type", ""),
+                    attachment.get("name", ""),
+                    size,
+                )
+            )
+        return lines
+
     def run_stage1_analysis(self, session_id: str) -> Dict[str, Any]:
         session = self._require_session(session_id)
         self._append_progress(session, "Stage1 started.")
-        session.paper_md = self._read_text_safe(session.paper_path)
+        self._ensure_paper_loaded(session)
         session.review_md = self._read_text_safe(session.review_path)
 
-        if not session.paper_md.strip():
-            raise ValueError("Paper markdown is empty.")
         if not session.review_md.strip():
             raise ValueError("Review markdown is empty.")
 
@@ -246,8 +309,9 @@ class RebuttalService:
                 [f"{x['reviewer_id']}: {x['summary'][:120]}" for x in reviewer_summaries]
             )
 
+        paper_context, paper_attachments = self._build_paper_prompt_context(session, char_limit=120000)
         planner_context = (
-            f"[paper markdown]\n```md\n{session.paper_md[:120000]}\n```\n\n"
+            f"{paper_context}\n\n"
             f"[reviewer summaries]\n```json\n{json.dumps(reviewer_summaries, ensure_ascii=False, indent=2)}\n```"
         )
         planner_text = self._run_prompt(
@@ -256,6 +320,7 @@ class RebuttalService:
             agent_name="stage1_experiment_planner",
             temperature=0.3,
             session=session,
+            attachments=paper_attachments,
         )
         planner_json = self._extract_json(planner_text)
         self._append_progress(session, "Stage1: experiment planner completed.")
@@ -366,8 +431,7 @@ class RebuttalService:
         session = self._require_session(session_id)
         self._append_progress(session, "Stage2 started.")
 
-        if not session.paper_md.strip() and session.paper_path:
-            session.paper_md = self._read_text_safe(session.paper_path)
+        self._ensure_paper_loaded(session)
         if not session.review_md.strip() and session.review_path:
             session.review_md = self._read_text_safe(session.review_path)
         if not session.reviewers and session.review_md.strip():
@@ -414,8 +478,9 @@ class RebuttalService:
             if not result_text:
                 source = "auto"
                 self._append_progress(session, f"Stage2: generating [AUTO] result for {exp_id}.")
+                paper_context, paper_attachments = self._build_paper_prompt_context(session, char_limit=60000)
                 auto_context = (
-                    f"[paper markdown]\n```md\n{session.paper_md[:60000]}\n```\n\n"
+                    f"{paper_context}\n\n"
                     f"[experiment task]\n```json\n{json.dumps(asdict(task), ensure_ascii=False, indent=2)}\n```"
                 )
                 result_text = self._run_prompt(
@@ -424,6 +489,7 @@ class RebuttalService:
                     agent_name=f"stage2_auto_result_generator_{exp_id}",
                     temperature=0.4,
                     session=session,
+                    attachments=paper_attachments,
                 ).strip()
                 if "[AUTO]" not in result_text:
                     result_text = f"[AUTO] {result_text}"
@@ -510,10 +576,11 @@ class RebuttalService:
                 comparison_needs,
                 session.comparison_paths,
             )
+            paper_context, paper_attachments = self._build_paper_prompt_context(session, char_limit=100000)
 
             writer_context = (
                 f"[reviewer id]\n{rid}\n\n"
-                f"[paper markdown]\n```md\n{session.paper_md[:100000]}\n```\n\n"
+                f"{paper_context}\n\n"
                 f"[reviewer raw review]\n```md\n{reviewer_raw_map.get(rid, '')}\n```\n\n"
                 f"[reviewer summary]\n```json\n{json.dumps(reviewer_summary_map.get(rid, {}), ensure_ascii=False, indent=2)}\n```\n\n"
                 f"[experiment evidence]\n```md\n{chr(10).join(evidence_md_lines)}\n```\n\n"
@@ -525,6 +592,7 @@ class RebuttalService:
                 agent_name=f"stage2_reviewer_rebuttal_writer_{rid}",
                 temperature=0.35,
                 session=session,
+                attachments=paper_attachments,
             ).strip()
 
             if not draft_text:
@@ -649,6 +717,7 @@ class RebuttalService:
         agent_name: str,
         temperature: float = 0.3,
         session: Optional[SessionState] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         prompt_text = load_prompt(prompt_file)
         run_id = ""
@@ -656,6 +725,8 @@ class RebuttalService:
             now_ms = int(time.time() * 1000)
             run_id = f"{now_ms}_{self._safe_log_name(agent_name)}"
             client = get_llm_client()
+            attachment_lines = self._attachment_log_lines(attachments)
+            attachment_log = "\n".join(attachment_lines) + "\n" if attachment_lines else "ATTACHMENTS: none\n"
             input_log = (
                 f"PROVIDER: {getattr(client, 'provider', 'unknown')}\n"
                 f"MODEL: {getattr(client, 'default_model', 'unknown')}\n"
@@ -663,6 +734,7 @@ class RebuttalService:
                 f"PROMPT_FILE: {prompt_file}\n"
                 f"TEMPERATURE: {temperature}\n"
                 f"SAVED_AT: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"{attachment_log}"
                 "-----PROMPT-----\n"
                 f"{prompt_text}\n"
                 "-----CONTEXT-----\n"
@@ -678,6 +750,7 @@ class RebuttalService:
         final_text, _ = get_llm_client().generate(
             instructions=prompt_text,
             input_text=context_text,
+            attachments=attachments,
             enable_reasoning=True,
             temperature=temperature,
             agent_name=agent_name,
@@ -705,6 +778,10 @@ class RebuttalService:
         except UnicodeDecodeError:
             with open(file_path, "r", encoding="utf-8", errors="replace") as f:
                 return f.read()
+
+    def _read_binary_safe(self, file_path: str) -> bytes:
+        with open(file_path, "rb") as f:
+            return f.read()
 
     def _save_json(self, path: str, payload: Any) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)

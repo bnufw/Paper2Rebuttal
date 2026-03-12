@@ -100,6 +100,8 @@ ZHIPUAI_API_KEY=<your_zhipuai_api_key>
 **You can alse edit the base_url in .env**
 
 > **Note:** Only configure the provider you plan to use.
+> 
+> If you use `Gemini + PDF` in Stage1, the app sends the uploaded PDF directly to Gemini and does not require `MISTRAL_API_KEY`. Non-Gemini PDF intake still uses Mistral OCR.
 
 ### Start with Gradio🤗
 
@@ -134,7 +136,7 @@ If your browser page is accidentally refreshed during processing, you can resume
 
 ### Workflow
 
-1. **Upload Files**: Upload your paper PDF and review text file (raw document including all reviewers' comments and their IDs)
+1. **Upload Files**: Upload your paper `.md` or `.pdf`, then provide review markdown or an OpenReview forum link.
 2. **Initial Analysis**: The system parses your paper and extracts reviewer issues
 3. **Strategy Review**: For each issue, review the AI-generated rebuttal strategy
 4. **Provide Feedback**: Refine strategies through natural language feedback

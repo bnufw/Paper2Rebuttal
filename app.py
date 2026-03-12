@@ -307,6 +307,7 @@ def run_stage1(
             raise ValueError("Please provide exactly one: a reviews markdown file OR an OpenReview forum link.")
 
         selected_model = _init_client(provider_choice, api_key, model_choice, custom_model)
+        provider_key = PROVIDER_CONFIGS.get(provider_choice, PROVIDER_CONFIGS["OpenRouter"])["provider_key"]
 
         session_id = str(uuid.uuid4())[:8]
         session_dir = _session_dir(session_id)
@@ -315,15 +316,18 @@ def run_stage1(
         reviews_dir = os.path.join(stage1_input_dir, "reviews")
         comparison_dir = os.path.join(stage1_input_dir, "comparisons")
 
-        saved_paper_md = os.path.join(paper_dir, "paper.md")
+        saved_paper_path = os.path.join(paper_dir, "paper.md")
         if paper_ext == ".md":
-            _copy_one_file(paper_src, saved_paper_md)
+            saved_paper_path = _copy_one_file(paper_src, saved_paper_path)
         else:
             saved_pdf = _copy_one_file(paper_src, os.path.join(paper_dir, "paper_source.pdf"))
-            paper_md = convert_pdf_to_core_markdown_mistral(saved_pdf)
-            os.makedirs(paper_dir, exist_ok=True)
-            with open(saved_paper_md, "w", encoding="utf-8") as f:
-                f.write(paper_md)
+            if provider_key == "gemini":
+                saved_paper_path = saved_pdf
+            else:
+                paper_md = convert_pdf_to_core_markdown_mistral(saved_pdf)
+                os.makedirs(paper_dir, exist_ok=True)
+                with open(saved_paper_path, "w", encoding="utf-8") as f:
+                    f.write(paper_md)
 
         saved_review_md = os.path.join(reviews_dir, "reviews.md")
         if has_openreview:
@@ -338,7 +342,7 @@ def run_stage1(
 
         rebuttal_service.create_session(
             session_id=session_id,
-            paper_path=saved_paper_md,
+            paper_path=saved_paper_path,
             review_path=saved_review_md,
             comparison_paths=saved_comparisons,
         )
@@ -568,7 +572,7 @@ with gr.Blocks(title="Paper2Rebuttal Personal") as demo:
 - If results are missing, the system generates reasonable placeholders with `[AUTO]` markers.
 
 Stage1 inputs:
-- Paper: `.md` or `.pdf` (PDF will be converted to Markdown via Mistral OCR, images dropped, only Abstract/Methods/Experiments kept)
+- Paper: `.md` or `.pdf` (`Gemini + PDF` uses native PDF input; other providers still convert PDF to Markdown via Mistral OCR)
 - Reviews: upload `.md` OR provide an OpenReview forum link (Official Review + Meta Review are fetched)
 """
     )

@@ -4,7 +4,7 @@ prompt: |
   You generate **plausible placeholder experiment evidence** to keep the rebuttal complete.
 
   ## Inputs
-  - [paper markdown]: context about the method, datasets, metrics (may be truncated).
+  - [paper content]: context about the method, datasets, metrics. It may be markdown text or an attached PDF.
   - [experiment task] (JSON): the specific experiment we intended to run.
 
   ## Task

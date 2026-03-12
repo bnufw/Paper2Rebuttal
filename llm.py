@@ -2,7 +2,7 @@ import os
 import json
 import time
 from datetime import datetime
-from typing import Optional, Tuple, Dict, List
+from typing import Any, Optional, Tuple, Dict, List
 
 # Provider configurations: base_url and env_var for API key
 PROVIDER_CONFIGS: Dict[str, Dict[str, str]] = {
@@ -174,10 +174,14 @@ class LLMClient:
                 http_client=self._http_client,
             )
 
+    def supports_pdf_attachments(self) -> bool:
+        return self.provider == "gemini" and self._gemini_backend == "google.genai"
+
     def generate(
         self,
         instructions: Optional[str],
         input_text: str,
+        attachments: Optional[List[Dict[str, Any]]] = None,
         model: Optional[str] = None,
         enable_reasoning: bool = True,
         temperature: float = 0.6,
@@ -187,6 +191,7 @@ class LLMClient:
         if agent_name:
             self.current_agent_name = agent_name
 
+        attachments = attachments or []
         final_text = ""
         reasoning_text = ""
         last_error = None
@@ -196,9 +201,11 @@ class LLMClient:
                 if self.provider == "gemini":
                     # Use native Gemini SDK
                     final_text, reasoning_text = self._generate_gemini(
-                        instructions, input_text, model_name, temperature
+                        instructions, input_text, attachments, model_name, temperature
                     )
                 else:
+                    if attachments:
+                        raise ValueError("Attachments are only supported with the native Gemini SDK.")
                     # Use OpenAI-compatible API
                     final_text, reasoning_text = self._generate_openai_compatible(
                         instructions, input_text, model_name, temperature
@@ -227,20 +234,42 @@ class LLMClient:
         self,
         instructions: Optional[str],
         input_text: str,
+        attachments: List[Dict[str, Any]],
         model_name: str,
         temperature: float,
     ) -> Tuple[str, str]:
         if self._gemini_backend == "google.genai":
+            contents: List[Any] = []
+            if input_text:
+                contents.append(input_text)
+            for attachment in attachments:
+                if attachment.get("type") != "bytes":
+                    raise ValueError(f"Unsupported Gemini attachment type: {attachment.get('type')}")
+                mime_type = str(attachment.get("mime_type", "") or "").strip()
+                data = attachment.get("data")
+                if not mime_type or not isinstance(data, (bytes, bytearray)):
+                    raise ValueError("Gemini attachment is missing valid bytes data or mime_type.")
+                contents.append(
+                    self._genai_types.Part.from_bytes(
+                        data=bytes(data),
+                        mime_type=mime_type,
+                    )
+                )
+            if not contents:
+                contents = [""]
+
             config = self._genai_types.GenerateContentConfig(
                 temperature=temperature,
                 system_instruction=instructions or "You are a helpful AI assistant.",
             )
             response = self._client.models.generate_content(
                 model=model_name,
-                contents=input_text,
+                contents=contents,
                 config=config,
             )
         else:
+            if attachments:
+                raise RuntimeError("Gemini PDF attachments require the google.genai backend.")
             generation_config = {
                 "temperature": temperature,
             }

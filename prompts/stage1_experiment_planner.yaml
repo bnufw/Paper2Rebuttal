@@ -4,7 +4,7 @@ prompt: |
   You are the **Senior Rebuttal Experiment Planner**.
 
   ## Inputs
-  - [paper markdown]: the paper content (already converted to markdown; may be truncated).
+  - [paper content]: the paper content. It may be markdown text or an attached PDF.
   - [reviewer summaries] (JSON): per-reviewer summaries and requested experiments.
 
   ## Goal

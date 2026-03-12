@@ -5,7 +5,7 @@ prompt: |
 
   ## Inputs
   - [reviewer id]: the target reviewer (e.g., R1).
-  - [paper markdown]: our paper content.
+  - [paper content]: our paper content. It may be markdown text or an attached PDF.
   - [reviewer raw review]: the full text from this reviewer only.
   - [reviewer summary] (JSON): summary + main_points + requested_experiments.
   - [experiment evidence]: bullet evidence lines (each line starts with an exp id like EXP1).
