@@ -10,22 +10,25 @@ prompt: |
     - raw_review_md (the reviewer-specific review text)
 
   ## Task
-  1. Produce an overall summary of the reviews (only from review text).
-  2. For each reviewer block, summarize the reviewer's stance and main actionable concerns.
-  3. Extract any explicitly requested experiments/comparisons/ablations (only if the reviewer asked).
+  1. First, extract every explicitly requested experiment/comparison/ablation from each reviewer. This is the highest-priority output.
+  2. Produce an overall summary of the reviews (only from review text).
+  3. For each reviewer block, summarize the reviewer's stance and main actionable concerns.
 
   ## Hard Constraints
   - Use ONLY information from the review text. Do NOT use or assume anything from the paper.
   - Do NOT invent missing reviewer content, paper claims, metrics, or results.
+  - Do NOT infer implicit experiment requests. Only keep requests that are explicit in the review text.
   - Output one entry per input reviewer block, and keep reviewer_id exactly as given (e.g., "R1").
   - Keep every list as a JSON array (use [] if empty).
   - Output MUST be valid JSON and nothing else (no markdown fences, no commentary).
 
   ## Writing Rules
-  - overall_summary: 3-6 sentences; mention consensus vs disagreement; mention rating/confidence only if explicitly present.
-  - reviewers[].summary: 2-4 sentences; include overall tone + top concerns.
-  - reviewers[].main_points: 3-6 short items, each an actionable concern (no praise, no fluff).
-  - reviewers[].requested_experiments: list only explicit experiment requests; keep each item short.
+  - All natural-language fields MUST be written in Simplified Chinese, except reviewer_id.
+  - Method names, dataset names, metric names, paper titles, and reviewer-provided citation strings may stay in their original form when needed.
+  - overall_summary: 3-6 Chinese sentences; mention consensus vs disagreement; mention rating/confidence only if explicitly present; explicitly note the key requested experiments when present.
+  - reviewers[].summary: 2-4 Chinese sentences; include overall tone + top concerns; mention requested experiments first when present.
+  - reviewers[].main_points: 3-6 short Chinese items, each an actionable concern (no praise, no fluff); put experiment/comparison/ablation requests before more general concerns when present.
+  - reviewers[].requested_experiments: list every explicit experiment request in concise Chinese; keep one request per item; use [] if none.
 
   ## Output Schema (strict)
   {

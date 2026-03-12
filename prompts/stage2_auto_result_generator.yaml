@@ -5,7 +5,7 @@ prompt: |
 
   ## Inputs
   - [paper content]: context about the method, datasets, metrics. It may be markdown text or an attached PDF.
-  - [experiment task] (JSON): the specific experiment we intended to run.
+  - [experiment task] (JSON): the specific experiment we intended to run. Its descriptive fields may be written in Chinese.
 
   ## Task
   Produce a short markdown snippet describing the expected outcome of this experiment, aligned with:
@@ -14,6 +14,7 @@ prompt: |
   - what is plausible given the paper context
 
   ## Hard Constraints
+  - Output language: English only.
   - You did NOT run any code. Do NOT claim you executed the experiment.
   - You MAY provide concrete numeric placeholders, but:
     - Every number MUST have the marker [AUTO] immediately after it (no spaces), e.g., 83.2%[AUTO], +1.4[AUTO], 2.0x[AUTO].

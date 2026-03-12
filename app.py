@@ -162,7 +162,7 @@ def _copy_one_file(src_path: str, dst_path: str) -> str:
 
 def _format_stage1_reviewer_summaries(rows: List[Dict[str, Any]]) -> str:
     if not rows:
-        return "(empty)"
+        return "（空）"
     lines: List[str] = []
     for row in rows:
         rid = row.get("reviewer_id", "R?")
@@ -170,12 +170,12 @@ def _format_stage1_reviewer_summaries(rows: List[Dict[str, Any]]) -> str:
         lines.append(row.get("summary", ""))
         points = row.get("main_points", []) or []
         if points:
-            lines.append("- Main points:")
+            lines.append("- 主要问题：")
             for p in points:
                 lines.append(f"  - {p}")
         reqs = row.get("requested_experiments", []) or []
         if reqs:
-            lines.append("- Requested experiments:")
+            lines.append("- Reviewer明确要求的实验：")
             for r in reqs:
                 lines.append(f"  - {r}")
         lines.append("")
@@ -184,40 +184,41 @@ def _format_stage1_reviewer_summaries(rows: List[Dict[str, Any]]) -> str:
 
 def _format_stage1_tasks(rows: List[Dict[str, Any]]) -> str:
     if not rows:
-        return "(No supplemental experiments were generated.)"
+        return "（未生成补充实验计划。）"
     lines: List[str] = []
     for row in rows:
         lines.append(f"## {row.get('exp_id', 'EXP?')}")
-        lines.append(f"- Related reviewers: {', '.join(row.get('related_reviewers', []) or [])}")
-        lines.append(f"- Goal: {row.get('goal', '')}")
-        lines.append(f"- How to run: {row.get('how_to_run', '')}")
-        lines.append("- Coding prompt (copy to Codex/Claude Code):")
+        lines.append(f"- 对应 reviewer：{', '.join(row.get('related_reviewers', []) or [])}")
+        lines.append(f"- 目标：{row.get('goal', '')}")
+        lines.append(f"- 执行方式：{row.get('how_to_run', '')}")
+        lines.append("- 可直接复制给 Codex/Claude Code 的提示词：")
         lines.append("```md")
         lines.append(row.get("coding_prompt_md", ""))
         lines.append("```")
         hint = row.get("expected_result_hint", "")
         if hint:
-            lines.append(f"- Expected trend hint: {hint}")
+            lines.append(f"- 预期趋势提示：{hint}")
         lines.append("")
     return "\n".join(lines)
 
 
 def _format_comparison_needs(rows: List[Dict[str, Any]]) -> str:
     if not rows:
-        return "(No explicit comparison-paper requirements were detected.)"
+        return "（未检测到明确的对比论文需求。）"
     lines: List[str] = []
     for row in rows:
         status = row.get("status", "missing")
         title = row.get("paper_title", "")
         reviewers = ", ".join(row.get("mentioned_by_reviewer", []) or [])
         reason = row.get("reason", "")
-        lines.append(f"- [{status.upper()}] {title}")
-        lines.append(f"  - Mentioned by: {reviewers}")
+        status_text = "已提供" if status == "provided" else "缺失"
+        lines.append(f"- [{status_text}] {title}")
+        lines.append(f"  - 提及 reviewer：{reviewers}")
         if reason:
-            lines.append(f"  - Reason: {reason}")
+            lines.append(f"  - 原因：{reason}")
         provided = row.get("provided_md_path", "")
         if provided:
-            lines.append(f"  - Provided md: {os.path.basename(provided)}")
+            lines.append(f"  - 已提供 md：{os.path.basename(provided)}")
     return "\n".join(lines)
 
 

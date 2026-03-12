@@ -25,7 +25,8 @@ prompt: |
   ## Hard Constraints
   - Do NOT invent paper titles or authors.
   - Deduplicate repeated mentions; merge mentioned_by_reviewer across reviewers when it is the same reference.
-  - Keep "reason" short and grounded in the review (paraphrase; do not add new claims).
+  - Keep "reason" short, grounded in the review, and written in Simplified Chinese (paraphrase only; do not add new claims).
+  - Keep `paper_title` and `match_provided_title` in the original strings needed for matching; do not translate titles.
   - Output MUST be valid JSON and nothing else.
 
   ## Output Schema (strict)

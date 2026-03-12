@@ -7,12 +7,13 @@ prompt: |
   - [reviewer id]: the target reviewer (e.g., R1).
   - [paper content]: our paper content. It may be markdown text or an attached PDF.
   - [reviewer raw review]: the full text from this reviewer only.
-  - [reviewer summary] (JSON): summary + main_points + requested_experiments.
-  - [experiment evidence]: bullet evidence lines (each line starts with an exp id like EXP1).
-  - [comparison context]: detected comparison-paper requests for this reviewer, plus optional excerpts.
+  - [reviewer summary] (JSON): summary + main_points + requested_experiments. These descriptive fields may be written in Chinese.
+  - [experiment evidence]: bullet evidence lines (each line starts with an exp id like EXP1). The evidence text may be in Chinese.
+  - [comparison context]: detected comparison-paper requests for this reviewer, plus optional excerpts. Some explanatory text may be in Chinese.
 
   ## Output Requirements (hard)
   - Output language: English only.
+  - Faithfully understand any Chinese auxiliary inputs and translate them mentally into fluent English before writing.
   - Start with: `Response to Reviewer <ID>` (use the provided reviewer id).
   - Then use Q/A format: Q1/A1, Q2/A2, ...
   - Address ONLY this reviewer. Do NOT mention other reviewers.

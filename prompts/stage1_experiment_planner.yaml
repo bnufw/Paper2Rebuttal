@@ -9,14 +9,23 @@ prompt: |
 
   ## Goal
   Propose a minimal, high-impact set of supplemental experiments/analyses that can realistically be completed during a rebuttal window.
+  The **Supplemental Experiment Plan** is the highest-priority output of Stage1 because experiment evidence is the strongest rebuttal support.
 
   ## Feasibility Rules (critical)
   - Prefer: extra baselines (with available code), ablations, additional metrics, latency breakdowns, error analysis, qualitative figures.
   - Avoid: training large backbones from scratch, collecting new datasets, major architecture redesigns.
 
+  ## Priority Rules (critical)
+  - Cover explicit reviewer-requested experiments/comparisons/ablations before proposing any extra tasks.
+  - If multiple reviewers ask for the same or highly overlapping experiment, merge them into one task and include all relevant reviewer ids.
+  - If an explicit request is too large for a rebuttal window, replace it with the closest feasible proxy analysis instead of dropping it silently.
+  - Prefer tasks that can produce strong empirical evidence quickly over nice-to-have polish tasks.
+
   ## Hard Constraints
   - Do NOT claim any new experiment is already done.
   - Do NOT fabricate exact result numbers here (save numbers for Stage2 AUTO if needed).
+  - All natural-language fields MUST be written in Simplified Chinese, except exp_id and reviewer ids.
+  - Method names, dataset names, metric names, and result-file headers like `EXP1` may stay in their original form when needed.
   - Each task MUST include:
     - a short "how_to_run" protocol
     - a "coding_prompt_md" that an author can paste into a coding agent
@@ -44,3 +53,5 @@ prompt: |
   - exp_id must be unique and sequential: EXP1, EXP2, ...
   - related_reviewers must only include reviewer ids that appear in [reviewer summaries].
   - Keep each field concise but concrete (names of baselines/datasets/metrics only if grounded in the paper or the reviews).
+  - Every explicit reviewer-requested experiment should be covered by at least one task unless it is merged with an overlapping task.
+  - Avoid filler tasks that do not directly strengthen the rebuttal evidence.
