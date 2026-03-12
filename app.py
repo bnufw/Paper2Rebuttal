@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import tempfile
@@ -232,10 +233,71 @@ def _session_dir(session_id: str) -> str:
     return os.path.join(SAVE_DIR, session_id)
 
 
-def _resolve_session_id(session_state, session_id_text: str) -> str:
-    if session_state and session_state.get("session_id"):
-        return session_state["session_id"]
-    return (session_id_text or "").strip()
+def _load_json_safe(path: str) -> Any:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _parse_saved_at_ts(saved_at: str) -> float:
+    try:
+        return float(time.mktime(time.strptime(saved_at, "%Y-%m-%d %H:%M:%S")))
+    except Exception:
+        return 0.0
+
+
+def list_recent_sessions(limit: int = 200) -> List[tuple[str, str]]:
+    """Return Gradio Dropdown choices: [(label, session_id), ...]."""
+    items: List[tuple[str, str, float]] = []
+    try:
+        for name in os.listdir(SAVE_DIR):
+            session_dir = os.path.join(SAVE_DIR, name)
+            if not os.path.isdir(session_dir):
+                continue
+
+            meta_path = os.path.join(session_dir, "outputs", "session_meta.json")
+            meta = _load_json_safe(meta_path)
+            if not isinstance(meta, dict):
+                continue
+
+            session_id = str(meta.get("session_id", "") or name).strip() or name
+            has_stage1 = bool(meta.get("has_stage1", False))
+            has_stage2 = bool(meta.get("has_stage2", False))
+
+            paper_path = str(meta.get("paper_path", "") or "")
+            paper_name = os.path.basename(paper_path) if paper_path else "paper?"
+
+            saved_at = str(meta.get("saved_at", "") or "")
+            ts = _parse_saved_at_ts(saved_at) if saved_at else 0.0
+            if ts <= 0:
+                try:
+                    ts = float(os.path.getmtime(meta_path))
+                except Exception:
+                    ts = 0.0
+            saved_at_disp = saved_at or (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "unknown")
+
+            label = f"{session_id} | {saved_at_disp} | S1:{has_stage1} S2:{has_stage2} | {paper_name}"
+            items.append((label, session_id, ts))
+    except Exception:
+        pass
+
+    items.sort(key=lambda x: x[2], reverse=True)
+    return [(label, session_id) for (label, session_id, _ts) in items[: max(0, int(limit))]]
+
+
+def refresh_recent_sessions(selected_session_id: str = ""):
+    choices = list_recent_sessions(limit=200)
+    values = [v for _label, v in choices]
+    value = selected_session_id if selected_session_id in values else (values[0] if values else None)
+    return gr.update(choices=choices, value=value)
+
+
+def _resolve_session_id(session_state) -> str:
+    if isinstance(session_state, dict):
+        return str(session_state.get("session_id", "") or "").strip()
+    return ""
 
 
 def on_provider_change(provider: str):
@@ -277,6 +339,127 @@ def _init_client(provider_choice: str, api_key: str, model_choice: str, custom_m
     return selected_model
 
 
+def _prepare_stage1_inputs(
+    session_id: str,
+    paper_src: str,
+    review_src: str,
+    comparison_paths: List[str],
+    provider_key: str,
+) -> tuple[str, str, List[str]]:
+    if not paper_src or not os.path.exists(paper_src):
+        raise ValueError("Saved paper input is missing.")
+    if not review_src or not os.path.exists(review_src):
+        raise ValueError("Saved review input is missing.")
+
+    paper_ext = os.path.splitext(paper_src)[1].lower()
+    if paper_ext not in [".md", ".pdf"]:
+        raise ValueError("Paper file must be .md or .pdf.")
+
+    for path in comparison_paths:
+        if not os.path.exists(path):
+            raise ValueError(f"Saved comparison input is missing: {path}")
+
+    session_dir = _session_dir(session_id)
+    stage1_input_dir = os.path.join(session_dir, "inputs", "stage1")
+    paper_dir = os.path.join(stage1_input_dir, "paper")
+    reviews_dir = os.path.join(stage1_input_dir, "reviews")
+    comparison_dir = os.path.join(stage1_input_dir, "comparisons")
+
+    saved_paper_path = os.path.join(paper_dir, "paper.md")
+    if paper_ext == ".md":
+        saved_paper_path = _copy_one_file(paper_src, saved_paper_path)
+    else:
+        saved_pdf = _copy_one_file(paper_src, os.path.join(paper_dir, "paper_source.pdf"))
+        if provider_key == "gemini":
+            saved_paper_path = saved_pdf
+        else:
+            paper_md = convert_pdf_to_core_markdown_mistral(saved_pdf)
+            os.makedirs(paper_dir, exist_ok=True)
+            with open(saved_paper_path, "w", encoding="utf-8") as f:
+                f.write(paper_md)
+
+    saved_review_md = _copy_one_file(review_src, os.path.join(reviews_dir, "reviews.md"))
+    saved_comparisons = _copy_files(comparison_paths, comparison_dir, "comparison")
+    return saved_paper_path, saved_review_md, saved_comparisons
+
+
+def _build_stage1_success_outputs(
+    session_id: str,
+    stage1: Dict[str, Any],
+    selected_model: str,
+    *,
+    source_session_id: str = "",
+):
+    reviewer_ids = [x.get("reviewer_id", "") for x in stage1.get("reviewer_summaries", []) if x.get("reviewer_id")]
+    session_dir = _session_dir(session_id)
+
+    if source_session_id:
+        status = (
+            f"Stage1 re-run complete. New session: `{session_id}`\n\n"
+            f"Source session: `{source_session_id}`\n"
+            f"Model: `{selected_model}` (current page settings)\n"
+            f"Reviewers detected: {', '.join(reviewer_ids) if reviewer_ids else 'R1'}\n"
+            f"Logs: `{os.path.join(session_dir, 'logs')}`"
+        )
+    else:
+        status = (
+            f"Stage1 complete. Session: `{session_id}`\n\n"
+            f"Model: `{selected_model}`\n"
+            f"Reviewers detected: {', '.join(reviewer_ids) if reviewer_ids else 'R1'}\n"
+            f"Logs: `{os.path.join(session_dir, 'logs')}`"
+        )
+
+    stage2_status = f"Stage2 is reset for session `{session_id}`. Run Stage2 when ready."
+
+    return (
+        {"session_id": session_id},
+        status,
+        stage1.get("overall_summary", ""),
+        _format_stage1_reviewer_summaries(stage1.get("reviewer_summaries", [])),
+        _format_stage1_tasks(stage1.get("experiment_tasks", [])),
+        _format_comparison_needs(stage1.get("comparison_needs", [])),
+        stage2_status,
+        gr.update(choices=reviewer_ids, value=(reviewer_ids[0] if reviewer_ids else None)),
+        "",
+        _draft_counter_text(0),
+        "",
+        "",
+        gr.update(choices=list_recent_sessions(limit=200), value=session_id),
+    )
+
+
+def _get_saved_stage1_inputs(session) -> tuple[str, str, List[str]]:
+    stage1_input_dir = os.path.join(session.session_dir, "inputs", "stage1")
+    paper_dir = os.path.join(stage1_input_dir, "paper")
+    reviews_dir = os.path.join(stage1_input_dir, "reviews")
+    comparisons_dir = os.path.join(stage1_input_dir, "comparisons")
+
+    pdf_candidate = os.path.join(paper_dir, "paper_source.pdf")
+    md_candidate = os.path.join(paper_dir, "paper.md")
+    review_candidate = os.path.join(reviews_dir, "reviews.md")
+
+    if os.path.exists(pdf_candidate):
+        paper_src = pdf_candidate
+    elif os.path.exists(md_candidate):
+        paper_src = md_candidate
+    else:
+        paper_src = session.paper_path
+
+    review_src = review_candidate if os.path.exists(review_candidate) else session.review_path
+
+    comparison_paths: List[str] = []
+    if os.path.isdir(comparisons_dir):
+        comparison_paths = [
+            os.path.join(comparisons_dir, name)
+            for name in sorted(os.listdir(comparisons_dir))
+            if os.path.isfile(os.path.join(comparisons_dir, name))
+        ]
+    elif session.comparison_paths:
+        comparison_paths = [path for path in session.comparison_paths if os.path.exists(path)]
+
+    return paper_src, review_src, comparison_paths
+
+
 def run_stage1(
     paper_file,
     review_file,
@@ -309,36 +492,22 @@ def run_stage1(
         selected_model = _init_client(provider_choice, api_key, model_choice, custom_model)
         provider_key = PROVIDER_CONFIGS.get(provider_choice, PROVIDER_CONFIGS["OpenRouter"])["provider_key"]
 
-        session_id = str(uuid.uuid4())[:8]
-        session_dir = _session_dir(session_id)
-        stage1_input_dir = os.path.join(session_dir, "inputs", "stage1")
-        paper_dir = os.path.join(stage1_input_dir, "paper")
-        reviews_dir = os.path.join(stage1_input_dir, "reviews")
-        comparison_dir = os.path.join(stage1_input_dir, "comparisons")
-
-        saved_paper_path = os.path.join(paper_dir, "paper.md")
-        if paper_ext == ".md":
-            saved_paper_path = _copy_one_file(paper_src, saved_paper_path)
-        else:
-            saved_pdf = _copy_one_file(paper_src, os.path.join(paper_dir, "paper_source.pdf"))
-            if provider_key == "gemini":
-                saved_paper_path = saved_pdf
-            else:
-                paper_md = convert_pdf_to_core_markdown_mistral(saved_pdf)
-                os.makedirs(paper_dir, exist_ok=True)
-                with open(saved_paper_path, "w", encoding="utf-8") as f:
-                    f.write(paper_md)
-
-        saved_review_md = os.path.join(reviews_dir, "reviews.md")
         if has_openreview:
             reviews_md = fetch_openreview_reviews_markdown(openreview_url)
-            os.makedirs(reviews_dir, exist_ok=True)
-            with open(saved_review_md, "w", encoding="utf-8") as f:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
                 f.write(reviews_md)
+                review_src = f.name
         else:
-            _copy_one_file(review_paths[0], saved_review_md)
+            review_src = review_paths[0]
 
-        saved_comparisons = _copy_files(comparison_paths, comparison_dir, "comparison")
+        session_id = str(uuid.uuid4())[:8]
+        saved_paper_path, saved_review_md, saved_comparisons = _prepare_stage1_inputs(
+            session_id=session_id,
+            paper_src=paper_src,
+            review_src=review_src,
+            comparison_paths=comparison_paths,
+            provider_key=provider_key,
+        )
 
         rebuttal_service.create_session(
             session_id=session_id,
@@ -347,30 +516,7 @@ def run_stage1(
             comparison_paths=saved_comparisons,
         )
         stage1 = rebuttal_service.run_stage1_analysis(session_id)
-
-        reviewer_ids = [x.get("reviewer_id", "") for x in stage1.get("reviewer_summaries", []) if x.get("reviewer_id")]
-
-        status = (
-            f"Stage1 complete. Session: `{session_id}`\n\n"
-            f"Model: `{selected_model}`\n"
-            f"Reviewers detected: {', '.join(reviewer_ids) if reviewer_ids else 'R1'}\n"
-            f"Logs: `{os.path.join(session_dir, 'logs')}`"
-        )
-
-        return (
-            {"session_id": session_id},
-            status,
-            stage1.get("overall_summary", ""),
-            _format_stage1_reviewer_summaries(stage1.get("reviewer_summaries", [])),
-            _format_stage1_tasks(stage1.get("experiment_tasks", [])),
-            _format_comparison_needs(stage1.get("comparison_needs", [])),
-            gr.update(choices=reviewer_ids, value=(reviewer_ids[0] if reviewer_ids else None)),
-            "",
-            _draft_counter_text(0),
-            "",
-            "",
-            session_id,
-        )
+        return _build_stage1_success_outputs(session_id, stage1, selected_model)
     except Exception as e:
         return (
             None,
@@ -379,31 +525,99 @@ def run_stage1(
             "",
             "",
             "",
+            "",
             gr.update(choices=[], value=None),
             "",
             _draft_counter_text(0),
             "",
             "",
+            gr.update(),
+        )
+
+
+def rerun_stage1_from_history(
+    source_session_id: str,
+    provider_choice: str,
+    api_key: str,
+    model_choice: str,
+    custom_model: str,
+):
+    try:
+        source_session_id = (source_session_id or "").strip()
+        if not source_session_id:
+            raise ValueError("Please select a session in History Sessions.")
+
+        source_session = rebuttal_service.restore_session_from_disk(source_session_id)
+        if not source_session:
+            raise ValueError(f"Session `{source_session_id}` not found on disk.")
+
+        selected_model = _init_client(provider_choice, api_key, model_choice, custom_model)
+        provider_key = PROVIDER_CONFIGS.get(provider_choice, PROVIDER_CONFIGS["OpenRouter"])["provider_key"]
+
+        paper_src, review_src, comparison_paths = _get_saved_stage1_inputs(source_session)
+        session_id = str(uuid.uuid4())[:8]
+        saved_paper_path, saved_review_md, saved_comparisons = _prepare_stage1_inputs(
+            session_id=session_id,
+            paper_src=paper_src,
+            review_src=review_src,
+            comparison_paths=comparison_paths,
+            provider_key=provider_key,
+        )
+
+        rebuttal_service.create_session(
+            session_id=session_id,
+            paper_path=saved_paper_path,
+            review_path=saved_review_md,
+            comparison_paths=saved_comparisons,
+        )
+        stage1 = rebuttal_service.run_stage1_analysis(session_id)
+        return _build_stage1_success_outputs(
+            session_id,
+            stage1,
+            selected_model,
+            source_session_id=source_session_id,
+        )
+    except Exception as e:
+        err = f"Stage1 re-run failed: {e}"
+        return (
+            None,
+            err,
             "",
+            "",
+            "",
+            "",
+            err,
+            gr.update(choices=[], value=None),
+            "",
+            _draft_counter_text(0),
+            "",
+            "",
+            gr.update(),
         )
 
 
 def load_session(session_id: str):
+    sid = (session_id or "").strip()
     try:
-        session_id = (session_id or "").strip()
-        if not session_id:
-            raise ValueError("Please provide Session ID.")
+        if not sid:
+            raise ValueError("Please select a session in History Sessions.")
 
-        session = rebuttal_service.restore_session_from_disk(session_id)
+        session = rebuttal_service.restore_session_from_disk(sid)
         if not session:
-            raise ValueError(f"Session `{session_id}` not found on disk.")
+            raise ValueError(f"Session `{sid}` not found on disk.")
 
         has_stage1 = bool(session.stage1_data)
         has_stage2 = bool(session.stage2_drafts)
 
-        reviewer_ids = rebuttal_service.get_reviewer_ids(session_id)
+        stage1 = session.stage1_data if has_stage1 else {}
+        overall = stage1.get("overall_summary", "") if has_stage1 else ""
+        per_reviewer = _format_stage1_reviewer_summaries(stage1.get("reviewer_summaries", [])) if has_stage1 else ""
+        tasks = _format_stage1_tasks(stage1.get("experiment_tasks", [])) if has_stage1 else ""
+        needs = _format_comparison_needs(stage1.get("comparison_needs", [])) if has_stage1 else ""
+
+        reviewer_ids = rebuttal_service.get_reviewer_ids(sid)
         first_id = reviewer_ids[0] if reviewer_ids else None
-        first = rebuttal_service.get_reviewer_draft(session_id, first_id) if first_id else None
+        first = rebuttal_service.get_reviewer_draft(sid, first_id) if first_id else None
 
         text = first.text if first else ""
         counter = _draft_counter_text(first.char_count, first.compression_note) if first else _draft_counter_text(0)
@@ -412,7 +626,7 @@ def load_session(session_id: str):
             auto = "[AUTO] used in this reviewer block." if first.used_auto_results else "No [AUTO] result used in this reviewer block."
 
         status = (
-            f"Session loaded: `{session_id}`\n\n"
+            f"Session loaded: `{sid}`\n\n"
             f"- has_stage1: `{has_stage1}`\n"
             f"- has_stage2: `{has_stage2}`\n"
             f"- reviewers: `{', '.join(reviewer_ids) if reviewer_ids else 'N/A'}`\n"
@@ -420,18 +634,29 @@ def load_session(session_id: str):
         )
 
         return (
-            {"session_id": session_id},
-            status,
+            {"session_id": sid},
+            status,  # stage1_status
+            overall,
+            per_reviewer,
+            tasks,
+            needs,
+            status,  # stage2_status
             gr.update(choices=reviewer_ids, value=first_id),
             text,
             counter,
             auto,
-            rebuttal_service.build_all_drafts_markdown(session_id) if has_stage2 else "",
+            rebuttal_service.build_all_drafts_markdown(sid) if has_stage2 else "",
         )
     except Exception as e:
+        err = f"Load session failed: {e}"
         return (
             None,
-            f"Load session failed: {e}",
+            err,  # stage1_status
+            "",
+            "",
+            "",
+            "",
+            err,  # stage2_status
             gr.update(choices=[], value=None),
             "",
             _draft_counter_text(0),
@@ -440,11 +665,11 @@ def load_session(session_id: str):
         )
 
 
-def run_stage2(experiment_result_files, additional_comparison_files, session_state, session_id_text):
+def run_stage2(experiment_result_files, additional_comparison_files, session_state):
     try:
-        session_id = _resolve_session_id(session_state, session_id_text)
+        session_id = _resolve_session_id(session_state)
         if not session_id:
-            raise ValueError("Please provide Session ID (run Stage1 or load session).")
+            raise ValueError("Please load a session (Session History -> Load) or run Stage1 first.")
 
         rebuttal_service.restore_session_from_disk(session_id)
         session_dir = _session_dir(session_id)
@@ -494,11 +719,11 @@ def run_stage2(experiment_result_files, additional_comparison_files, session_sta
         )
 
 
-def on_reviewer_change(reviewer_id: str, session_state, session_id_text):
+def on_reviewer_change(reviewer_id: str, session_state):
     if not reviewer_id:
         return "", _draft_counter_text(0), ""
 
-    session_id = _resolve_session_id(session_state, session_id_text)
+    session_id = _resolve_session_id(session_state)
     if not session_id:
         return "", _draft_counter_text(0), ""
 
@@ -510,13 +735,13 @@ def on_reviewer_change(reviewer_id: str, session_state, session_id_text):
     return draft.text, _draft_counter_text(draft.char_count, draft.compression_note), auto_info
 
 
-def apply_edit(reviewer_id: str, rebuttal_text: str, session_state, session_id_text):
+def apply_edit(reviewer_id: str, rebuttal_text: str, session_state):
     try:
         if not reviewer_id:
             raise ValueError("Please choose a reviewer.")
-        session_id = _resolve_session_id(session_state, session_id_text)
+        session_id = _resolve_session_id(session_state)
         if not session_id:
-            raise ValueError("Session is missing. Run Stage1 or load session first.")
+            raise ValueError("Session is missing. Load a session (Session History -> Load) or run Stage1 first.")
 
         updated = rebuttal_service.finalize_reviewer_rebuttal(session_id, reviewer_id, rebuttal_text)
 
@@ -619,6 +844,19 @@ Stage1 inputs:
             outputs=[custom_model_input],
         )
 
+    history_choices = list_recent_sessions(limit=200)
+    history_default = history_choices[0][1] if history_choices else None
+    with gr.Row():
+        history_sessions = gr.Dropdown(
+            label="History Sessions",
+            choices=history_choices,
+            value=history_default,
+            scale=5,
+        )
+        with gr.Column(scale=1, min_width=180):
+            load_history_btn = gr.Button("Load", variant="primary")
+            rerun_history_stage1_btn = gr.Button("Re-run Stage1", variant="secondary")
+
     with gr.Tab("Stage1: Analyze Reviews"):
         with gr.Row():
             paper_input = gr.File(label="Paper (.md / .pdf)", file_types=[".md", ".pdf"], file_count="single")
@@ -642,13 +880,6 @@ Stage1 inputs:
         comparison_needs = gr.Markdown(label="Comparison Paper Needs")
 
     with gr.Tab("Stage2: Generate Final Rebuttal"):
-        with gr.Row():
-            session_id_input = gr.Textbox(
-                label="Session ID (for resume)",
-                placeholder="Paste the session id here (e.g., 1a2b3c4d)",
-            )
-            load_session_btn = gr.Button("Load Session", variant="secondary")
-
         with gr.Row():
             exp_result_input = gr.File(
                 label="Experiment Results Markdown (.md, optional, multiple)",
@@ -676,6 +907,57 @@ Stage1 inputs:
         download_btn = gr.Button("Download All Drafts", variant="secondary")
         download_file = gr.File(label="Download", visible=False)
 
+    demo.load(
+        fn=refresh_recent_sessions,
+        inputs=[history_sessions],
+        outputs=[history_sessions],
+    )
+
+    load_history_btn.click(
+        fn=load_session,
+        inputs=[history_sessions],
+        outputs=[
+            session_state,
+            stage1_status,
+            overall_summary,
+            reviewer_summary,
+            experiment_tasks,
+            comparison_needs,
+            stage2_status,
+            reviewer_selector,
+            rebuttal_editor,
+            char_counter,
+            auto_info,
+            all_drafts_output,
+        ],
+    )
+
+    rerun_history_stage1_btn.click(
+        fn=rerun_stage1_from_history,
+        inputs=[
+            history_sessions,
+            provider_choice,
+            api_key_input,
+            model_choice,
+            custom_model_input,
+        ],
+        outputs=[
+            session_state,
+            stage1_status,
+            overall_summary,
+            reviewer_summary,
+            experiment_tasks,
+            comparison_needs,
+            stage2_status,
+            reviewer_selector,
+            rebuttal_editor,
+            char_counter,
+            auto_info,
+            all_drafts_output,
+            history_sessions,
+        ],
+    )
+
     stage1_btn.click(
         fn=run_stage1,
         inputs=[
@@ -695,36 +977,31 @@ Stage1 inputs:
             reviewer_summary,
             experiment_tasks,
             comparison_needs,
+            stage2_status,
             reviewer_selector,
             rebuttal_editor,
             char_counter,
             auto_info,
             all_drafts_output,
-            session_id_input,
+            history_sessions,
         ],
     )
 
     stage2_btn.click(
         fn=run_stage2,
-        inputs=[exp_result_input, stage2_comparison_input, session_state, session_id_input],
+        inputs=[exp_result_input, stage2_comparison_input, session_state],
         outputs=[stage2_status, reviewer_selector, rebuttal_editor, char_counter, auto_info, all_drafts_output],
-    )
-
-    load_session_btn.click(
-        fn=load_session,
-        inputs=[session_id_input],
-        outputs=[session_state, stage2_status, reviewer_selector, rebuttal_editor, char_counter, auto_info, all_drafts_output],
     )
 
     reviewer_selector.change(
         fn=on_reviewer_change,
-        inputs=[reviewer_selector, session_state, session_id_input],
+        inputs=[reviewer_selector, session_state],
         outputs=[rebuttal_editor, char_counter, auto_info],
     )
 
     apply_btn.click(
         fn=apply_edit,
-        inputs=[reviewer_selector, rebuttal_editor, session_state, session_id_input],
+        inputs=[reviewer_selector, rebuttal_editor, session_state],
         outputs=[rebuttal_editor, char_counter, auto_info, all_drafts_output],
     )
 

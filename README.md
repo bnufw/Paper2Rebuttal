@@ -127,10 +127,15 @@ python app.py --device cuda --port 8080
 
 ### 🔄 Session Recovery
 If your browser page is accidentally refreshed during processing, you can resume your session:
-1. Enter your API Key in the configuration section
-2. Click **🔄 Refresh List** to see active sessions
-3. Select your session from the dropdown
-4. Click **▶️ Resume Selected Session**
+1. Find **History Sessions** at the top of the page (sessions are loaded from `gradio_uploads/`)
+2. Select your session in the dropdown
+3. Click **Load**
+
+To reuse a previous session's saved paper/reviews/comparison inputs without uploading again:
+1. Select the old session in **History Sessions**
+2. Click **Re-run Stage1**
+3. The app creates a **new session** and re-runs Stage1 with your **current page model settings**
+
 > ⚠️ Note: If the server restarts, the app will attempt to restore sessions from `gradio_uploads`. This is best-effort and depends on saved logs/summaries, so some in-memory progress may be missing.
 
 
