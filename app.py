@@ -8,6 +8,9 @@ from typing import Any, Dict, List
 
 import gradio as gr
 from fastapi import FastAPI
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().with_name(".env"))
 
 from rebuttal_service import init_llm_client, rebuttal_service
 from tools import convert_pdf_to_core_markdown_mistral, fetch_openreview_reviews_markdown
@@ -245,7 +248,7 @@ def on_provider_change(provider: str):
             label=config["label"],
             placeholder=f"Please enter your API Key ({config['placeholder']})",
             value=env_key,
-            info="API key is only used in this session." + (" (Loaded from .env)" if env_key else ""),
+            info="API key is only used in this session." + (" (Loaded from environment/.env)" if env_key else ""),
         ),
         gr.update(choices=list(model_choices.keys()), value=default_model),
     )

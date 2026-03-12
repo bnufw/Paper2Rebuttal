@@ -123,12 +123,25 @@ class LLMClient:
         config = PROVIDER_CONFIGS.get(self.provider, PROVIDER_CONFIGS["openrouter"])
         
         if self.provider == "gemini":
-            # Use native Google Generative AI SDK
-            import google.generativeai as genai
-            genai.configure(api_key=api_key)
-            self._genai = genai
-            self._client = None
+            self._genai = None
+            self._genai_types = None
+            self._gemini_backend = ""
             self._http_client = None
+            try:
+                from google import genai
+                from google.genai import types as genai_types
+
+                self._client = genai.Client(api_key=api_key)
+                self._genai_types = genai_types
+                self._gemini_backend = "google.genai"
+            except ImportError:
+                # Backward-compatible fallback for environments that have not installed google-genai yet.
+                import google.generativeai as genai
+
+                genai.configure(api_key=api_key)
+                self._genai = genai
+                self._client = None
+                self._gemini_backend = "google.generativeai"
         else:
             # Use OpenAI-compatible API
             import httpx
@@ -217,25 +230,31 @@ class LLMClient:
         model_name: str,
         temperature: float,
     ) -> Tuple[str, str]:
-        """Generate using native Google Generative AI SDK"""
-        # Create model with system instruction
-        generation_config = {
-            "temperature": temperature,
-        }
-        
-        model = self._genai.GenerativeModel(
-            model_name=model_name,
-            system_instruction=instructions or "You are a helpful AI assistant.",
-            generation_config=generation_config,
-        )
-        
-        response = model.generate_content(input_text)
-        
+        if self._gemini_backend == "google.genai":
+            config = self._genai_types.GenerateContentConfig(
+                temperature=temperature,
+                system_instruction=instructions or "You are a helpful AI assistant.",
+            )
+            response = self._client.models.generate_content(
+                model=model_name,
+                contents=input_text,
+                config=config,
+            )
+        else:
+            generation_config = {
+                "temperature": temperature,
+            }
+            model = self._genai.GenerativeModel(
+                model_name=model_name,
+                system_instruction=instructions or "You are a helpful AI assistant.",
+                generation_config=generation_config,
+            )
+            response = model.generate_content(input_text)
+
         final_text = ""
         if response.text:
             final_text = response.text
         
-        # Track token usage if available
         if self.token_tracker and hasattr(response, "usage_metadata"):
             usage = response.usage_metadata
             prompt_tokens = getattr(usage, "prompt_token_count", 0)
@@ -298,4 +317,3 @@ class LLMClient:
             print(f"[Token] {self.current_agent_name}: in={prompt_tokens}, out={completion_tokens}")
 
         return final_text, ""
-

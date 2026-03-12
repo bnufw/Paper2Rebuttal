@@ -311,8 +311,31 @@ def fetch_openreview_reviews_markdown(openreview_url: str) -> str:
                 return int(v)
         return 0
 
-    def invitation(n) -> str:
-        return str(get_attr(n, "invitation", "") or "")
+    def invitations(n) -> list[str]:
+        vals = []
+
+        single = get_attr(n, "invitation", None)
+        if single:
+            vals.append(str(single))
+
+        multi = get_attr(n, "invitations", None) or []
+        if isinstance(multi, str):
+            multi = [multi]
+        vals.extend(str(x) for x in multi if x)
+
+        parent = get_attr(n, "parentInvitations", None)
+        if isinstance(parent, str) and parent:
+            vals.append(parent)
+        elif isinstance(parent, list):
+            vals.extend(str(x) for x in parent if x)
+
+        seen = set()
+        out = []
+        for v in vals:
+            if v not in seen:
+                seen.add(v)
+                out.append(v)
+        return out
 
     def signature(n) -> str:
         sigs = get_attr(n, "signatures", None) or []
@@ -323,13 +346,13 @@ def fetch_openreview_reviews_markdown(openreview_url: str) -> str:
     official_by_sig = {}
     meta_notes = []
     for n in notes:
-        inv = invitation(n).lower()
-        if "official_review" in inv:
+        invs = [x.lower() for x in invitations(n)]
+        if any("official_review" in inv for inv in invs):
             sig = signature(n) or str(get_attr(n, "id", "") or "")
             prev = official_by_sig.get(sig)
             if (prev is None) or (note_time(n) >= note_time(prev)):
                 official_by_sig[sig] = n
-        elif "meta_review" in inv:
+        elif any("meta_review" in inv for inv in invs):
             meta_notes.append(n)
 
     def unwrap(v):
@@ -409,9 +432,9 @@ def fetch_openreview_reviews_markdown(openreview_url: str) -> str:
             md_lines.append("\n\n---\n\n".join(merged))
             md_lines.append("")
 
-    out = "\n".join(md_lines).strip()
-    if len(out) < 20:
+    if not official_by_sig and not meta_notes:
         raise ValueError("No Official_Review/Meta_Review notes found for this forum.")
+    out = "\n".join(md_lines).strip()
     return out + "\n"
 def _safe_filename(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*]+', '_', name)[:100]
