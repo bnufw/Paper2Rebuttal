@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
 from rebuttal_service import init_llm_client, rebuttal_service
-from tools import convert_pdf_to_core_markdown_mistral, fetch_openreview_reviews_markdown
+from tools import convert_pdf_to_core_markdown_mistral, fetch_openreview_reviews_markdown, strip_markdown_images
 
 
 def _noop(self, app: FastAPI):
@@ -230,6 +230,10 @@ def _draft_counter_text(char_count: int, note: str = "") -> str:
     return base
 
 
+def _render_openreview_preview(md_text: str) -> str:
+    return strip_markdown_images(md_text or "")
+
+
 def _session_dir(session_id: str) -> str:
     return os.path.join(SAVE_DIR, session_id)
 
@@ -422,6 +426,7 @@ def _build_stage1_success_outputs(
         stage2_status,
         gr.update(choices=reviewer_ids, value=(reviewer_ids[0] if reviewer_ids else None)),
         "",
+        "",
         _draft_counter_text(0),
         "",
         "",
@@ -529,6 +534,7 @@ def run_stage1(
             "",
             gr.update(choices=[], value=None),
             "",
+            "",
             _draft_counter_text(0),
             "",
             "",
@@ -590,6 +596,7 @@ def rerun_stage1_from_history(
             err,
             gr.update(choices=[], value=None),
             "",
+            "",
             _draft_counter_text(0),
             "",
             "",
@@ -644,6 +651,7 @@ def load_session(session_id: str):
             status,  # stage2_status
             gr.update(choices=reviewer_ids, value=first_id),
             text,
+            _render_openreview_preview(text),
             counter,
             auto,
             rebuttal_service.build_all_drafts_markdown(sid) if has_stage2 else "",
@@ -659,6 +667,7 @@ def load_session(session_id: str):
             "",
             err,  # stage2_status
             gr.update(choices=[], value=None),
+            "",
             "",
             _draft_counter_text(0),
             "",
@@ -705,6 +714,7 @@ def run_stage2(experiment_result_files, additional_comparison_files, session_sta
             status,
             gr.update(choices=reviewer_ids, value=reviewer_ids[0]),
             first.text,
+            _render_openreview_preview(first.text),
             _draft_counter_text(first.char_count, first.compression_note),
             "[AUTO] used in this reviewer block." if first.used_auto_results else "No [AUTO] result used in this reviewer block.",
             rebuttal_service.build_all_drafts_markdown(session_id),
@@ -714,6 +724,7 @@ def run_stage2(experiment_result_files, additional_comparison_files, session_sta
             f"Stage2 failed: {e}",
             gr.update(choices=[], value=None),
             "",
+            "",
             _draft_counter_text(0),
             "",
             "",
@@ -722,18 +733,18 @@ def run_stage2(experiment_result_files, additional_comparison_files, session_sta
 
 def on_reviewer_change(reviewer_id: str, session_state):
     if not reviewer_id:
-        return "", _draft_counter_text(0), ""
+        return "", "", _draft_counter_text(0), ""
 
     session_id = _resolve_session_id(session_state)
     if not session_id:
-        return "", _draft_counter_text(0), ""
+        return "", "", _draft_counter_text(0), ""
 
     draft = rebuttal_service.get_reviewer_draft(session_id, reviewer_id)
     if not draft:
-        return "", _draft_counter_text(0), ""
+        return "", "", _draft_counter_text(0), ""
 
     auto_info = "[AUTO] used in this reviewer block." if draft.used_auto_results else "No [AUTO] result used in this reviewer block."
-    return draft.text, _draft_counter_text(draft.char_count, draft.compression_note), auto_info
+    return draft.text, _render_openreview_preview(draft.text), _draft_counter_text(draft.char_count, draft.compression_note), auto_info
 
 
 def apply_edit(reviewer_id: str, rebuttal_text: str, session_state):
@@ -749,12 +760,17 @@ def apply_edit(reviewer_id: str, rebuttal_text: str, session_state):
         auto_info = "[AUTO] used in this reviewer block." if updated.used_auto_results else "No [AUTO] result used in this reviewer block."
         return (
             updated.text,
+            _render_openreview_preview(updated.text),
             _draft_counter_text(updated.char_count, updated.compression_note),
             auto_info,
             rebuttal_service.build_all_drafts_markdown(session_id),
         )
     except Exception as e:
-        return rebuttal_text, _draft_counter_text(len(rebuttal_text or "")), f"Edit apply failed: {e}", ""
+        return rebuttal_text, _render_openreview_preview(rebuttal_text), _draft_counter_text(len(rebuttal_text or "")), f"Edit apply failed: {e}", ""
+
+
+def on_rebuttal_input(rebuttal_text: str):
+    return _render_openreview_preview(rebuttal_text)
 
 
 def download_all_drafts(all_drafts_text: str):
@@ -778,6 +794,26 @@ APP_CSS = """
     border: 1px solid #e2e8f0;
     border-radius: 8px;
     padding: 10px;
+}
+#rebuttal-preview {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    min-height: 360px;
+    padding: 16px;
+}
+#rebuttal-preview table {
+    display: block;
+    overflow-x: auto;
+    border-collapse: collapse;
+}
+#rebuttal-preview th,
+#rebuttal-preview td {
+    border: 1px solid #cbd5e1;
+    padding: 6px 10px;
+}
+#rebuttal-preview pre {
+    overflow-x: auto;
 }
 """
 
@@ -897,7 +933,21 @@ Stage1 inputs:
         stage2_status = gr.Markdown(elem_id="stage-status")
 
         reviewer_selector = gr.Dropdown(label="Reviewer", choices=[], value=None)
-        rebuttal_editor = gr.Textbox(label="Rebuttal (editable)", lines=18)
+        with gr.Tabs():
+            with gr.Tab("Write"):
+                rebuttal_editor = gr.Textbox(label="Rebuttal (editable)", lines=18)
+            with gr.Tab("Preview"):
+                rebuttal_preview = gr.Markdown(
+                    value="",
+                    elem_id="rebuttal-preview",
+                    sanitize_html=True,
+                    line_breaks=False,
+                    header_links=False,
+                    latex_delimiters=[
+                        {"left": "$$", "right": "$$", "display": True},
+                        {"left": "$", "right": "$", "display": False},
+                    ],
+                )
         char_counter = gr.Markdown(value=_draft_counter_text(0), elem_id="char-counter")
         auto_info = gr.Markdown("")
 
@@ -927,6 +977,7 @@ Stage1 inputs:
             stage2_status,
             reviewer_selector,
             rebuttal_editor,
+            rebuttal_preview,
             char_counter,
             auto_info,
             all_drafts_output,
@@ -952,6 +1003,7 @@ Stage1 inputs:
             stage2_status,
             reviewer_selector,
             rebuttal_editor,
+            rebuttal_preview,
             char_counter,
             auto_info,
             all_drafts_output,
@@ -981,6 +1033,7 @@ Stage1 inputs:
             stage2_status,
             reviewer_selector,
             rebuttal_editor,
+            rebuttal_preview,
             char_counter,
             auto_info,
             all_drafts_output,
@@ -991,19 +1044,27 @@ Stage1 inputs:
     stage2_btn.click(
         fn=run_stage2,
         inputs=[exp_result_input, stage2_comparison_input, session_state],
-        outputs=[stage2_status, reviewer_selector, rebuttal_editor, char_counter, auto_info, all_drafts_output],
+        outputs=[stage2_status, reviewer_selector, rebuttal_editor, rebuttal_preview, char_counter, auto_info, all_drafts_output],
     )
 
     reviewer_selector.change(
         fn=on_reviewer_change,
         inputs=[reviewer_selector, session_state],
-        outputs=[rebuttal_editor, char_counter, auto_info],
+        outputs=[rebuttal_editor, rebuttal_preview, char_counter, auto_info],
+    )
+
+    rebuttal_editor.input(
+        fn=on_rebuttal_input,
+        inputs=[rebuttal_editor],
+        outputs=[rebuttal_preview],
+        queue=False,
+        show_progress="hidden",
     )
 
     apply_btn.click(
         fn=apply_edit,
         inputs=[reviewer_selector, rebuttal_editor, session_state],
-        outputs=[rebuttal_editor, char_counter, auto_info, all_drafts_output],
+        outputs=[rebuttal_editor, rebuttal_preview, char_counter, auto_info, all_drafts_output],
     )
 
     download_btn.click(
@@ -1027,6 +1088,6 @@ if __name__ == "__main__":
         server_name=args.host,
         server_port=args.port,
         share=args.share,
-        theme=gr.themes.Soft(),
+        theme=gr.themes.Soft(font=gr.themes.Default().font),
         css=APP_CSS,
     )
