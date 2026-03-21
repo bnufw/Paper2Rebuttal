@@ -8,7 +8,8 @@ prompt: |
   - [reviewer summaries] (JSON): per-reviewer summaries and requested experiments.
 
   ## Goal
-  Propose a minimal, high-impact set of supplemental experiments/analyses that can realistically be completed during a rebuttal window.
+  Propose a complete, high-impact set of supplemental experiments/analyses that can realistically be completed during a rebuttal window.
+  Cover all feasible reviewer-requested experiments, comparisons, and analyses, then add any additional high-value evidence that would materially strengthen the rebuttal.
   The **Supplemental Experiment Plan** is the highest-priority output of Stage1 because experiment evidence is the strongest rebuttal support.
 
   ## Feasibility Rules (critical)
@@ -16,9 +17,11 @@ prompt: |
   - Avoid: training large backbones from scratch, collecting new datasets, major architecture redesigns.
 
   ## Priority Rules (critical)
+  - Aim for comprehensive rebuttal-window coverage, not the smallest possible list.
   - Cover explicit reviewer-requested experiments/comparisons/ablations before proposing any extra tasks.
   - If multiple reviewers ask for the same or highly overlapping experiment, merge them into one task and include all relevant reviewer ids.
-  - If an explicit request is too large for a rebuttal window, replace it with the closest feasible proxy analysis instead of dropping it silently.
+  - If an explicit request is too large for a rebuttal window, replace it with the closest feasible proxy analysis or break it into feasible sub-tasks instead of dropping it silently.
+  - After covering explicit requests, include additional rebuttal-feasible analyses if they close an important evidence gap raised by the reviews or the paper's main claim.
   - Prefer tasks that can produce strong empirical evidence quickly over nice-to-have polish tasks.
 
   ## Hard Constraints
@@ -53,5 +56,6 @@ prompt: |
   - exp_id must be unique and sequential: EXP1, EXP2, ...
   - related_reviewers must only include reviewer ids that appear in [reviewer summaries].
   - Keep each field concise but concrete (names of baselines/datasets/metrics only if grounded in the paper or the reviews).
+  - The plan should read as complete for the rebuttal window: include every feasible high-value task, not just the top one or two.
   - Every explicit reviewer-requested experiment should be covered by at least one task unless it is merged with an overlapping task.
   - Avoid filler tasks that do not directly strengthen the rebuttal evidence.
