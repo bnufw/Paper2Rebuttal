@@ -1,5 +1,5 @@
 name: stage2_reviewer_rebuttal_writer
-description: Write per-reviewer final rebuttal block (English, <=5000 chars)
+description: Write per-reviewer rebuttal draft from evidence and response plan (English, <=5000 chars preferred)
 prompt: |
   You are a senior researcher writing a **final rebuttal block** to ONE reviewer.
 
@@ -7,40 +7,39 @@ prompt: |
   - [reviewer id]: the target reviewer (e.g., R1).
   - [paper content]: our paper content. It may be markdown text or an attached PDF.
   - [reviewer raw review]: the full text from this reviewer only.
-  - [reviewer summary] (JSON): summary + main_points + requested_experiments. These descriptive fields may be written in Chinese.
-  - [experiment evidence]: bullet evidence lines (each line starts with an exp id like EXP1). The evidence text may be in Chinese.
-  - [comparison context]: detected comparison-paper requests for this reviewer, plus optional excerpts. Some explanatory text may be in Chinese.
+  - [reviewer summary] (JSON): summary + main_points + requested_experiments.
+  - [reviewer response plan] (JSON): main_position_en + must_answer_points_cn + planned_evidence + open_tbd_items.
+  - [experiment evidence]: bullet evidence lines. Some evidence text may be in Chinese.
+  - [comparison context]: reviewer-specific comparison notes. It may mention `provided_md: yes` with excerpts, or `provided_pdf: yes` when a PDF is attached.
 
-  ## Output Requirements (hard)
+  ## Output Requirements
   - Output language: English only.
-  - Faithfully understand any Chinese auxiliary inputs and translate them mentally into fluent English before writing.
-  - Start with: `Response to Reviewer <ID>` (use the provided reviewer id).
+  - Start with `Response to Reviewer <ID>`.
   - Then use Q/A format: Q1/A1, Q2/A2, ...
-  - Address ONLY this reviewer. Do NOT mention other reviewers.
-  - Do NOT expose internal metadata like "(auto)", "(user)", "stage1/stage2", or the input section headers.
+  - Address only this reviewer.
   - Use only facts from the provided inputs.
-  - Do NOT invent new numbers or results beyond what is explicitly present in the inputs.
-  - If you use any number that contains [AUTO], keep the [AUTO] marker attached to that number.
-  - Keep the whole block under 5000 characters (aim for <= 4800).
+  - Do NOT invent new numbers or results.
+  - If a number already contains [AUTO], keep the [AUTO] marker attached.
+  - Do NOT add [AUTO] to non-numeric statements.
+  - If [comparison context] contains [lack], keep the [lack] marker in the final answer and state the material gap explicitly.
+  - Aim for <= 4800 characters.
 
-  ## How To Use Evidence
-  - When responding to experiment/comparison requests, incorporate the relevant evidence and mention the exp id once (e.g., "EXP2: ...").
-  - If there is no mapped evidence, respond with a concrete plan and avoid numbers.
+  ## Source-of-Truth Rules
+  - Treat [reviewer raw review] and [reviewer response plan] as the main control signals.
+  - Use [reviewer summary] only as a compact helper.
+  - Every item in must_answer_points_cn should appear in the final answer, but express it naturally in English.
 
-  ## Comparison-Paper Requests (novelty)
-  - If [comparison context] includes `provided_md: yes` with an excerpt, use ONLY that excerpt; do not guess beyond it.
-  - If `provided_md: no`, do not fabricate claims about that paper. Instead:
-    - clarify our method at a high level
-    - state we will add a dedicated comparison/discussion in the revision
-    - propose a concrete differentiator based on our paper (no unknown details about the other work)
+  ## Comparison Rules
+  - If [comparison context] includes `provided_md: yes`, use only the given excerpt.
+  - If [comparison context] includes `provided_pdf: yes`, use only the attached comparison PDF plus the context notes.
+  - If [comparison context] includes an attribution note saying the reviewer source is unclear, state that the paper is being addressed conservatively because reviewer attribution could not be localized.
+  - If [comparison context] includes `[lack]`, explain that the comparison material is currently unavailable and keep the statement high-level.
+  - If comparison material is missing, do not fabricate claims about the other paper.
 
   ## Style
   - Professional, polite, concise.
-  - Concrete, falsifiable statements over rhetoric.
+  - Concrete statements over rhetoric.
   - Use LaTeX for math when needed.
-  - Keep Q/A count small (typically 3-6).
-
-  ## Optional (only if helpful)
-  - You may include at most ONE tiny markdown table (<= 4 rows) to present key results.
+  - Keep Q/A count small, usually 3-6.
 
   Output plain markdown only.

@@ -3,7 +3,6 @@ import os
 import shutil
 import tempfile
 import time
-import uuid
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -13,7 +12,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
-from rebuttal_service import init_llm_client, rebuttal_service
+from rebuttal_service import get_llm_client, init_llm_client, rebuttal_service
 from tools import convert_pdf_to_core_markdown_mistral, fetch_openreview_reviews_markdown, strip_markdown_images
 
 
@@ -146,8 +145,6 @@ def _copy_files(src_paths: List[str], dst_dir: str, prefix: str) -> List[str]:
     copied: List[str] = []
     for i, src in enumerate(src_paths, start=1):
         base = os.path.basename(src)
-        if not base.lower().endswith(".md"):
-            base = f"{base}.md"
         dst = os.path.join(dst_dir, f"{prefix}_{i}_{base}")
         shutil.copy(src, dst)
         copied.append(dst)
@@ -202,24 +199,94 @@ def _format_stage1_tasks(rows: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _format_reviewer_response_plans(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return "（未生成 reviewer 回复提纲。）"
+    lines: List[str] = []
+    for row in rows:
+        rid = row.get("reviewer_id", "R?")
+        lines.append(f"## {rid}")
+        main_position = row.get("main_position_en", "")
+        if main_position:
+            lines.append(f"- Overall stance: {main_position}")
+        must_answer = row.get("must_answer_points_cn", []) or []
+        if must_answer:
+            lines.append("- 必须回应：")
+            for item in must_answer:
+                lines.append(f"  - {item}")
+        planned_evidence = row.get("planned_evidence", []) or []
+        if planned_evidence:
+            lines.append("- 计划证据：")
+            for item in planned_evidence:
+                lines.append(f"  - {item}")
+        open_tbd = row.get("open_tbd_items", []) or []
+        if open_tbd:
+            lines.append("- 待补项：")
+            for item in open_tbd:
+                lines.append(f"  - {item}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def _format_comparison_needs(rows: List[Dict[str, Any]]) -> str:
     if not rows:
         return "（未检测到明确的对比论文需求。）"
+    status_map = {
+        "provided": "已提供",
+        "downloaded": "已下载",
+        "search_failed": "搜索失败",
+        "missing": "仍缺失",
+    }
     lines: List[str] = []
     for row in rows:
         status = row.get("status", "missing")
         title = row.get("paper_title", "")
         reviewers = ", ".join(row.get("mentioned_by_reviewer", []) or [])
         reason = row.get("reason", "")
-        status_text = "已提供" if status == "provided" else "缺失"
+        reviewer_scope = row.get("reviewer_scope", "explicit")
+        status_text = status_map.get(status, "仍缺失")
         lines.append(f"- [{status_text}] {title}")
-        lines.append(f"  - 提及 reviewer：{reviewers}")
+        if reviewer_scope == "all_due_to_unclear_attribution":
+            lines.append("  - 归属说明：评审文本里无法明确定位 reviewer，Stage2 将向全部 reviewer 传入并说明。")
+        else:
+            lines.append(f"  - 提及 reviewer：{reviewers}")
         if reason:
             lines.append(f"  - 原因：{reason}")
-        provided = row.get("provided_md_path", "")
+        direct_url = row.get("direct_url", "") or ""
+        if direct_url:
+            lines.append(f"  - 评审原始链接：{direct_url}")
+        search_query = row.get("search_query", "") or ""
+        if search_query:
+            lines.append(f"  - 检索词：{search_query}")
+        retrieval_provider = row.get("retrieval_provider", "") or ""
+        if retrieval_provider:
+            lines.append(f"  - 检索来源：{retrieval_provider}")
+        resolved_url = row.get("resolved_url", "") or ""
+        if resolved_url:
+            lines.append(f"  - 命中链接：{resolved_url}")
+        provided = row.get("provided_source_path", "") or row.get("provided_md_path", "")
+        source_type = row.get("provided_source_type", "") or ("md" if row.get("provided_md_path", "") else "")
         if provided:
-            lines.append(f"  - 已提供 md：{os.path.basename(provided)}")
+            label = "pdf" if source_type == "pdf" else "md"
+            lines.append(f"  - 已提供 {label}：{os.path.basename(provided)}")
+            if source_type == "pdf" and status == "downloaded":
+                lines.append("  - 说明：Stage2 或重新执行含该 PDF 的 Stage1 时，需要 Gemini 原生 PDF 附件后端。")
+        retrieval_note = row.get("retrieval_note", "") or ""
+        if retrieval_note:
+            lines.append(f"  - 备注：{retrieval_note}")
     return "\n".join(lines)
+
+
+def _ensure_comparison_pdf_support(comparison_paths: List[str]) -> None:
+    pdf_paths = [path for path in comparison_paths if str(path).lower().endswith(".pdf")]
+    if not pdf_paths:
+        return
+    client = get_llm_client()
+    if client.provider != "gemini" or not client.supports_pdf_attachments():
+        raise ValueError(
+            "Comparison PDF files require Gemini native PDF input (google.genai backend). "
+            "Please switch to Gemini or upload comparison markdown files."
+        )
 
 
 def _draft_counter_text(char_count: int, note: str = "") -> str:
@@ -236,6 +303,16 @@ def _render_openreview_preview(md_text: str) -> str:
 
 def _session_dir(session_id: str) -> str:
     return os.path.join(SAVE_DIR, session_id)
+
+
+def _make_session_id() -> str:
+    base = time.strftime("%Y-%m-%d_%H-%M")
+    candidate = base
+    suffix = 1
+    while os.path.exists(_session_dir(candidate)):
+        candidate = f"{base}-{suffix:02d}"
+        suffix += 1
+    return candidate
 
 
 def _load_json_safe(path: str) -> Any:
@@ -422,6 +499,7 @@ def _build_stage1_success_outputs(
         stage1.get("overall_summary", ""),
         _format_stage1_reviewer_summaries(stage1.get("reviewer_summaries", [])),
         _format_stage1_tasks(stage1.get("experiment_tasks", [])),
+        _format_reviewer_response_plans(stage1.get("reviewer_response_plans", [])),
         _format_comparison_needs(stage1.get("comparison_needs", [])),
         stage2_status,
         gr.update(choices=reviewer_ids, value=(reviewer_ids[0] if reviewer_ids else None)),
@@ -497,6 +575,7 @@ def run_stage1(
 
         selected_model = _init_client(provider_choice, api_key, model_choice, custom_model)
         provider_key = PROVIDER_CONFIGS.get(provider_choice, PROVIDER_CONFIGS["OpenRouter"])["provider_key"]
+        _ensure_comparison_pdf_support(comparison_paths)
 
         if has_openreview:
             reviews_md = fetch_openreview_reviews_markdown(openreview_url)
@@ -506,7 +585,7 @@ def run_stage1(
         else:
             review_src = review_paths[0]
 
-        session_id = str(uuid.uuid4())[:8]
+        session_id = _make_session_id()
         saved_paper_path, saved_review_md, saved_comparisons = _prepare_stage1_inputs(
             session_id=session_id,
             paper_src=paper_src,
@@ -527,6 +606,7 @@ def run_stage1(
         return (
             None,
             f"Stage1 failed: {e}",
+            "",
             "",
             "",
             "",
@@ -562,7 +642,8 @@ def rerun_stage1_from_history(
         provider_key = PROVIDER_CONFIGS.get(provider_choice, PROVIDER_CONFIGS["OpenRouter"])["provider_key"]
 
         paper_src, review_src, comparison_paths = _get_saved_stage1_inputs(source_session)
-        session_id = str(uuid.uuid4())[:8]
+        _ensure_comparison_pdf_support(comparison_paths)
+        session_id = _make_session_id()
         saved_paper_path, saved_review_md, saved_comparisons = _prepare_stage1_inputs(
             session_id=session_id,
             paper_src=paper_src,
@@ -589,6 +670,7 @@ def rerun_stage1_from_history(
         return (
             None,
             err,
+            "",
             "",
             "",
             "",
@@ -621,6 +703,7 @@ def load_session(session_id: str):
         overall = stage1.get("overall_summary", "") if has_stage1 else ""
         per_reviewer = _format_stage1_reviewer_summaries(stage1.get("reviewer_summaries", [])) if has_stage1 else ""
         tasks = _format_stage1_tasks(stage1.get("experiment_tasks", [])) if has_stage1 else ""
+        response_plans = _format_reviewer_response_plans(stage1.get("reviewer_response_plans", [])) if has_stage1 else ""
         needs = _format_comparison_needs(stage1.get("comparison_needs", [])) if has_stage1 else ""
 
         reviewer_ids = rebuttal_service.get_reviewer_ids(sid)
@@ -647,6 +730,7 @@ def load_session(session_id: str):
             overall,
             per_reviewer,
             tasks,
+            response_plans,
             needs,
             status,  # stage2_status
             gr.update(choices=reviewer_ids, value=first_id),
@@ -661,6 +745,7 @@ def load_session(session_id: str):
         return (
             None,
             err,  # stage1_status
+            "",
             "",
             "",
             "",
@@ -686,6 +771,7 @@ def run_stage2(experiment_result_files, additional_comparison_files, session_sta
 
         exp_paths = _extract_paths(experiment_result_files)
         add_comp_paths = _extract_paths(additional_comparison_files)
+        _ensure_comparison_pdf_support(add_comp_paths)
 
         run_tag = time.strftime("%Y%m%d_%H%M%S")
         stage2_input_dir = os.path.join(session_dir, "inputs", f"stage2_{run_tag}")
@@ -766,7 +852,7 @@ def apply_edit(reviewer_id: str, rebuttal_text: str, session_state):
             rebuttal_service.build_all_drafts_markdown(session_id),
         )
     except Exception as e:
-        return rebuttal_text, _render_openreview_preview(rebuttal_text), _draft_counter_text(len(rebuttal_text or "")), f"Edit apply failed: {e}", ""
+        return rebuttal_text, _render_openreview_preview(rebuttal_text), _draft_counter_text(rebuttal_service.count_chars(rebuttal_text or "")), f"Edit apply failed: {e}", ""
 
 
 def on_rebuttal_input(rebuttal_text: str):
@@ -825,17 +911,20 @@ with gr.Blocks(title="Paper2Rebuttal Personal") as demo:
         """
 # Paper2Rebuttal (Personal Two-Stage Mode)
 
-- Stage1: Upload `paper.md` + `reviews.md` (+ optional comparison-paper `.md` files), then get:
+- Stage1: Upload `paper.md` + `reviews.md` (+ optional comparison-paper `.md` / `.pdf` files), then get:
   - overall reviewer opinion summary
   - per-reviewer summary
   - supplemental experiment plan (copyable coding prompts)
-  - missing comparison-paper list
-- Stage2: Upload experiment-result `.md` (optional) and additional comparison `.md` (optional), then generate final rebuttal blocks per reviewer (English, each <= 5000 chars).
-- If results are missing, the system generates reasonable placeholders with `[AUTO]` markers.
+  - reviewer-specific response plans
+  - missing comparison-paper list, with automatic high-confidence search/download from arXiv / OpenReview / CVF when possible
+- Stage2: Upload experiment-result `.md` (optional) and additional comparison `.md` / `.pdf` (optional), then generate final rebuttal blocks per reviewer (English, each <= 5000 chars).
+- If results are missing, the system first reuses grounded values already present in the paper or comparison material; only guessed placeholders keep `[AUTO]` markers.
+- If comparison material is missing for a reviewer-relevant paper, Stage2 keeps an explicit `[lack]` marker.
 
 Stage1 inputs:
 - Paper: `.md` or `.pdf` (`Gemini + PDF` uses native PDF input; other providers still convert PDF to Markdown via Mistral OCR)
 - Reviews: upload `.md` OR provide an OpenReview forum link (Official Review + Meta Review are fetched)
+- Comparison papers: `.md` always works; `.pdf` requires Gemini native PDF input
 """
     )
 
@@ -903,8 +992,8 @@ Stage1 inputs:
             placeholder="https://openreview.net/forum?id=...",
         )
         comparison_input = gr.File(
-            label="Comparison Papers Markdown (.md, optional, multiple)",
-            file_types=[".md"],
+            label="Comparison Papers (.md / .pdf, optional, multiple; .pdf requires Gemini native PDF input)",
+            file_types=[".md", ".pdf"],
             file_count="multiple",
         )
 
@@ -914,6 +1003,7 @@ Stage1 inputs:
         overall_summary = gr.Textbox(label="Overall Reviewer Opinion Summary", lines=6)
         reviewer_summary = gr.Markdown(label="Per-Reviewer Summary")
         experiment_tasks = gr.Textbox(label="Supplemental Experiment Plan (copy-ready)", lines=16)
+        reviewer_response_plans = gr.Markdown(label="Reviewer Response Plans")
         comparison_needs = gr.Markdown(label="Comparison Paper Needs")
 
     with gr.Tab("Stage2: Generate Final Rebuttal"):
@@ -924,8 +1014,8 @@ Stage1 inputs:
                 file_count="multiple",
             )
             stage2_comparison_input = gr.File(
-                label="Additional Comparison Papers (.md, optional, multiple)",
-                file_types=[".md"],
+                label="Additional Comparison Papers (.md / .pdf, optional, multiple; .pdf requires Gemini native PDF input)",
+                file_types=[".md", ".pdf"],
                 file_count="multiple",
             )
 
@@ -973,6 +1063,7 @@ Stage1 inputs:
             overall_summary,
             reviewer_summary,
             experiment_tasks,
+            reviewer_response_plans,
             comparison_needs,
             stage2_status,
             reviewer_selector,
@@ -999,6 +1090,7 @@ Stage1 inputs:
             overall_summary,
             reviewer_summary,
             experiment_tasks,
+            reviewer_response_plans,
             comparison_needs,
             stage2_status,
             reviewer_selector,
@@ -1029,6 +1121,7 @@ Stage1 inputs:
             overall_summary,
             reviewer_summary,
             experiment_tasks,
+            reviewer_response_plans,
             comparison_needs,
             stage2_status,
             reviewer_selector,

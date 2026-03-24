@@ -6,7 +6,12 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from llm import LLMClient, TokenUsageTracker
-from tools import _fix_json_escapes, load_prompt
+from tools import (
+    _fix_json_escapes,
+    download_pdf_to_local,
+    load_prompt,
+    resolve_comparison_paper_candidate,
+)
 
 
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -55,11 +60,29 @@ class ExperimentTask:
 
 
 @dataclass
+class ReviewerResponsePlan:
+    reviewer_id: str
+    main_position_en: str
+    must_answer_points_cn: List[str]
+    planned_evidence: List[str]
+    open_tbd_items: List[str]
+
+
+@dataclass
 class ComparisonNeed:
     paper_title: str
     mentioned_by_reviewer: List[str]
     reason: str
-    provided_md_path: str = ""
+    reviewer_scope: str = "explicit"
+    direct_url: str = ""
+    search_query: str = ""
+    source_hint: str = "unknown"
+    provided_file_id: str = ""
+    provided_source_path: str = ""
+    provided_source_type: str = ""
+    retrieval_provider: str = ""
+    resolved_url: str = ""
+    retrieval_note: str = ""
     status: str = "missing"
 
 
@@ -177,7 +200,8 @@ class RebuttalService:
         return self.sessions.get(session_id)
 
     def count_chars(self, text: str) -> int:
-        return len(text or "")
+        normalized = re.sub(r"\[(?i:auto)\]", "", text or "")
+        return len(normalized)
 
     def _paper_is_pdf(self, session: SessionState) -> bool:
         return str(session.paper_path or "").lower().endswith(".pdf")
@@ -228,21 +252,305 @@ class RebuttalService:
         paper_text = session.paper_md[:char_limit] if char_limit else session.paper_md
         return f"[paper content]\n```md\n{paper_text}\n```", []
 
+    def _path_source_type(self, path: str) -> str:
+        ext = str(path or "").lower()
+        if ext.endswith(".pdf"):
+            return "pdf"
+        if ext.endswith(".md"):
+            return "md"
+        return "unknown"
+
+    def _build_comparison_items(self, comparison_paths: List[str]) -> List[Dict[str, str]]:
+        items: List[Dict[str, str]] = []
+        for idx, path in enumerate(comparison_paths or [], start=1):
+            if not os.path.exists(path):
+                continue
+            source_type = self._path_source_type(path)
+            display_name = os.path.splitext(os.path.basename(path))[0]
+            if source_type == "md":
+                title = self._extract_title_from_markdown(
+                    self._read_text_safe(path),
+                    fallback=os.path.basename(path),
+                ).strip()
+                if title:
+                    display_name = title
+            items.append(
+                {
+                    "file_id": f"CMP{idx}",
+                    "display_name": display_name,
+                    "source_type": source_type,
+                    "path": path,
+                }
+            )
+        return items
+
+    def _build_comparison_pdf_attachments(self, items: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+        attachments: List[Dict[str, Any]] = []
+        has_pdf = any(item.get("source_type") == "pdf" for item in items)
+        if has_pdf:
+            client = get_llm_client()
+            if client.provider != "gemini" or not client.supports_pdf_attachments():
+                raise ValueError(
+                    "Comparison PDF files require Gemini native PDF input (google.genai backend)."
+                )
+        for item in items:
+            if item.get("source_type") != "pdf":
+                continue
+            path = item.get("path", "")
+            if not path or not os.path.exists(path):
+                continue
+            pdf_bytes = self._read_binary_safe(path)
+            if not pdf_bytes:
+                continue
+            attachments.append(
+                {
+                    "type": "bytes",
+                    "mime_type": "application/pdf",
+                    "data": pdf_bytes,
+                    "name": os.path.basename(path),
+                    "lead_text": (
+                        "[comparison attachment]\n"
+                        f"file_id: {item.get('file_id', '')}\n"
+                        f"display_name: {item.get('display_name', '')}\n"
+                        "The next attached PDF corresponds to this comparison item."
+                    ),
+                }
+            )
+        return attachments
+
     def _attachment_log_lines(self, attachments: Optional[List[Dict[str, Any]]]) -> List[str]:
         lines: List[str] = []
         for idx, attachment in enumerate(attachments or [], start=1):
             data = attachment.get("data")
             size = len(data) if isinstance(data, (bytes, bytearray)) else 0
             lines.append(
-                "ATTACHMENT_{}: type={} mime_type={} name={} bytes={}".format(
+                "ATTACHMENT_{}: type={} mime_type={} name={} bytes={} lead_text={}".format(
                     idx,
                     attachment.get("type", ""),
                     attachment.get("mime_type", ""),
                     attachment.get("name", ""),
                     size,
+                    "yes" if attachment.get("lead_text") else "no",
                 )
             )
         return lines
+
+    def _extract_urls_from_text(self, text: str) -> List[str]:
+        return [x.rstrip(").,;]>}") for x in re.findall(r"https?://[^\s<>\"]+", text or "")]
+
+    def _verified_direct_url(self, candidate_url: str, review_md: str) -> str:
+        candidate_url = str(candidate_url or "").strip().rstrip(").,;]>}")
+        if not candidate_url:
+            return ""
+        review_urls = self._extract_urls_from_text(review_md)
+        for url in review_urls:
+            if candidate_url == url:
+                return url
+        return ""
+
+    def _normalize_source_hint(self, source_hint: str, direct_url: str = "") -> str:
+        hint = str(source_hint or "").strip().lower()
+        host = ""
+        try:
+            from urllib.parse import urlparse
+
+            host = (urlparse(direct_url).hostname or "").lower()
+        except Exception:
+            host = ""
+
+        if host.endswith("arxiv.org") or host == "export.arxiv.org":
+            return "arxiv"
+        if "openreview" in host:
+            return "openreview"
+        if "thecvf.com" in host:
+            return "cvf"
+
+        if hint in {"arxiv", "openreview", "cvf"}:
+            return hint
+        if any(token in hint for token in ["cvpr", "iccv", "eccv", "wacv", "thecvf", "openaccess"]):
+            return "cvf"
+        return "unknown"
+
+    def _apply_comparison_item_to_need(
+        self,
+        need: ComparisonNeed,
+        item: Dict[str, str],
+        status: Optional[str] = None,
+    ) -> None:
+        need.provided_file_id = str(item.get("file_id", "")).strip()
+        need.provided_source_path = str(item.get("path", "")).strip()
+        need.provided_source_type = str(item.get("source_type", "")).strip()
+        need.status = status or need.status or "provided"
+
+    def _match_existing_comparison_item(
+        self,
+        need: ComparisonNeed,
+        available_items: List[Dict[str, str]],
+    ) -> Optional[Dict[str, str]]:
+        if not available_items:
+            return None
+
+        if need.provided_file_id:
+            for item in available_items:
+                if str(item.get("file_id", "")).strip() == need.provided_file_id:
+                    return item
+
+        if need.provided_source_path:
+            for item in available_items:
+                if str(item.get("path", "")).strip() == need.provided_source_path:
+                    return item
+
+        title_map: Dict[str, Dict[str, str]] = {}
+        for item in available_items:
+            norm_title = self._normalize_title(item.get("display_name", ""))
+            if norm_title:
+                title_map[norm_title] = item
+        fuzzy = self._fuzzy_match_title(need.paper_title, list(title_map.keys()))
+        if fuzzy:
+            return title_map.get(fuzzy)
+        return None
+
+    def _comparison_inputs_dir(self, session: SessionState) -> str:
+        path = os.path.join(session.session_dir, "inputs", "stage1", "comparisons")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _auto_resolve_comparison_needs(
+        self,
+        session: SessionState,
+        comparison_needs: List[ComparisonNeed],
+    ) -> List[ComparisonNeed]:
+        if not comparison_needs:
+            return comparison_needs
+
+        available_items = self._build_comparison_items(session.comparison_paths)
+        resolved_cache: Dict[str, Dict[str, Any]] = {}
+        changed = False
+
+        for need in comparison_needs:
+            matched_item = self._match_existing_comparison_item(need, available_items)
+            if matched_item:
+                existing_status = need.status if need.status in {"downloaded", "provided"} else "provided"
+                self._apply_comparison_item_to_need(need, matched_item, status=existing_status)
+                if not need.retrieval_note and existing_status == "provided":
+                    need.retrieval_note = "Matched to an existing comparison file."
+                continue
+
+            cache_key = f"{self._normalize_title(need.paper_title)}|{need.direct_url}"
+            cached = resolved_cache.get(cache_key)
+            if cached:
+                if cached.get("path"):
+                    if cached["path"] not in session.comparison_paths:
+                        session.comparison_paths.append(cached["path"])
+                        changed = True
+                        available_items = self._build_comparison_items(session.comparison_paths)
+                    matched_item = self._match_existing_comparison_item(need, available_items)
+                    if matched_item:
+                        self._apply_comparison_item_to_need(need, matched_item, status="downloaded")
+                    need.retrieval_provider = str(cached.get("provider", "")).strip()
+                    need.resolved_url = str(cached.get("resolved_url", "")).strip()
+                    need.retrieval_note = str(cached.get("retrieval_note", "")).strip()
+                else:
+                    need.status = str(cached.get("status", "search_failed")).strip() or "search_failed"
+                    need.retrieval_provider = str(cached.get("provider", "")).strip()
+                    need.resolved_url = str(cached.get("resolved_url", "")).strip()
+                    need.retrieval_note = str(cached.get("retrieval_note", "")).strip()
+                continue
+
+            candidate = resolve_comparison_paper_candidate(
+                paper_title=need.paper_title,
+                direct_url=need.direct_url,
+                search_query=need.search_query,
+                source_hint=need.source_hint,
+            )
+            if not candidate:
+                note = "No high-confidence match found across arXiv, OpenReview, and CVF."
+                need.status = "search_failed"
+                need.retrieval_note = note
+                self._append_progress(session, f"Stage1: no auto comparison match found for `{need.paper_title}`.")
+                resolved_cache[cache_key] = {
+                    "path": "",
+                    "provider": "",
+                    "resolved_url": "",
+                    "retrieval_note": note,
+                    "status": "search_failed",
+                }
+                continue
+
+            provider = str(candidate.get("provider", "")).strip()
+            resolved_url = str(candidate.get("resolved_url", "") or candidate.get("pdf_url", "")).strip()
+            note = str(candidate.get("match_note", "")).strip() or "Matched from automatic paper search."
+            pdf_url = str(candidate.get("pdf_url", "")).strip()
+            try:
+                file_stem = "_".join(
+                    [
+                        provider or "paper",
+                        str(candidate.get("paper_id", "")).strip(),
+                        need.paper_title,
+                    ]
+                )
+                pdf_path = download_pdf_to_local(
+                    pdf_url=pdf_url,
+                    output_dir=self._comparison_inputs_dir(session),
+                    file_stem=file_stem,
+                    source_label="auto",
+                )
+                self._append_progress(
+                    session,
+                    f"Stage1: downloaded comparison paper `{need.paper_title}` from {provider or 'unknown source'}.",
+                )
+            except Exception as e:
+                fail_note = f"{note} Download failed: {e}"
+                need.status = "search_failed"
+                need.retrieval_provider = provider
+                need.resolved_url = resolved_url
+                need.retrieval_note = fail_note
+                self._append_progress(
+                    session,
+                    f"Stage1: auto comparison download failed for `{need.paper_title}` ({provider or 'unknown source'}).",
+                )
+                resolved_cache[cache_key] = {
+                    "path": "",
+                    "provider": provider,
+                    "resolved_url": resolved_url,
+                    "retrieval_note": fail_note,
+                    "status": "search_failed",
+                }
+                continue
+
+            if pdf_path not in session.comparison_paths:
+                session.comparison_paths.append(pdf_path)
+                changed = True
+            available_items = self._build_comparison_items(session.comparison_paths)
+            matched_item = self._match_existing_comparison_item(
+                ComparisonNeed(
+                    paper_title=need.paper_title,
+                    mentioned_by_reviewer=[],
+                    reason="",
+                    provided_source_path=pdf_path,
+                ),
+                available_items,
+            )
+            if matched_item:
+                self._apply_comparison_item_to_need(need, matched_item, status="downloaded")
+            else:
+                need.provided_source_path = pdf_path
+                need.provided_source_type = self._path_source_type(pdf_path)
+                need.status = "downloaded"
+            need.retrieval_provider = provider
+            need.resolved_url = resolved_url
+            need.retrieval_note = note
+            resolved_cache[cache_key] = {
+                "path": pdf_path,
+                "provider": provider,
+                "resolved_url": resolved_url,
+                "retrieval_note": note,
+                "status": "downloaded",
+            }
+
+        if changed:
+            self._save_session_meta(session)
+        return comparison_needs
 
     def run_stage1_analysis(self, session_id: str) -> Dict[str, Any]:
         session = self._require_session(session_id)
@@ -309,10 +617,58 @@ class RebuttalService:
                 [f"{x['reviewer_id']}: {x['summary'][:120]}" for x in reviewer_summaries]
             )
 
+        issue_refiner_context = (
+            f"[review original text]\n```md\n{session.review_md}\n```\n\n"
+            f"[reviewer blocks]\n```json\n{json.dumps(reviewer_blocks_payload, ensure_ascii=False, indent=2)}\n```\n\n"
+            f"[reviewer summaries]\n```json\n{json.dumps(reviewer_summaries, ensure_ascii=False, indent=2)}\n```"
+        )
+        issue_refiner_text = self._run_prompt(
+            "stage1_issue_refiner.yaml",
+            issue_refiner_context,
+            agent_name="stage1_issue_refiner",
+            temperature=0.2,
+            session=session,
+        )
+        issue_refiner_json = self._extract_json(issue_refiner_text)
+        self._append_progress(session, "Stage1: issue refiner completed.")
+
+        canonical_issues: List[Dict[str, Any]] = []
+        if isinstance(issue_refiner_json, dict):
+            for idx, item in enumerate(issue_refiner_json.get("canonical_issues", []) or [], start=1):
+                if not isinstance(item, dict):
+                    continue
+                related_reviewers = [
+                    self._normalize_reviewer_id(x)
+                    for x in (item.get("related_reviewers", []) or [])
+                    if self._normalize_reviewer_id(x)
+                ]
+                category = str(item.get("category", "")).strip().lower()
+                if category not in {"experiment", "comparison", "clarification", "writing"}:
+                    category = "clarification"
+                canonical_issues.append(
+                    {
+                        "issue_id": str(item.get("issue_id", "")).strip() or f"ISSUE{idx}",
+                        "related_reviewers": related_reviewers,
+                        "category": category,
+                        "summary_cn": str(item.get("summary_cn", "")).strip(),
+                        "evidence_quotes": [
+                            str(x).strip()
+                            for x in (item.get("evidence_quotes", []) or [])
+                            if str(x).strip()
+                        ],
+                        "needs_new_evidence": bool(item.get("needs_new_evidence", False)),
+                    }
+                )
+        if not canonical_issues:
+            canonical_issues = self._build_default_canonical_issues(reviewer_summaries)
+
         paper_context, paper_attachments = self._build_paper_prompt_context(session, char_limit=120000)
         planner_context = (
             f"{paper_context}\n\n"
-            f"[reviewer summaries]\n```json\n{json.dumps(reviewer_summaries, ensure_ascii=False, indent=2)}\n```"
+            f"[review original text]\n```md\n{session.review_md}\n```\n\n"
+            f"[reviewer blocks]\n```json\n{json.dumps(reviewer_blocks_payload, ensure_ascii=False, indent=2)}\n```\n\n"
+            f"[reviewer summaries]\n```json\n{json.dumps(reviewer_summaries, ensure_ascii=False, indent=2)}\n```\n\n"
+            f"[canonical issues]\n```json\n{json.dumps(canonical_issues, ensure_ascii=False, indent=2)}\n```"
         )
         planner_text = self._run_prompt(
             "stage1_experiment_planner.yaml",
@@ -347,20 +703,63 @@ class RebuttalService:
                     )
                 )
 
-        provided_title_to_path: Dict[str, str] = {}
-        provided_titles: List[str] = []
-        for path in session.comparison_paths:
-            if not os.path.exists(path):
-                continue
-            title = self._extract_title_from_markdown(self._read_text_safe(path), fallback=os.path.basename(path))
-            norm_title = self._normalize_title(title)
-            if norm_title:
-                provided_title_to_path[norm_title] = path
-                provided_titles.append(title)
+        reviewer_response_plans: List[ReviewerResponsePlan] = []
+        if isinstance(planner_json, dict):
+            for row in planner_json.get("reviewer_response_plans", []) or []:
+                if not isinstance(row, dict):
+                    continue
+                rid = self._normalize_reviewer_id(row.get("reviewer_id", ""))
+                if not rid:
+                    continue
+                reviewer_response_plans.append(
+                    ReviewerResponsePlan(
+                        reviewer_id=rid,
+                        main_position_en=str(row.get("main_position_en", "")).strip(),
+                        must_answer_points_cn=[
+                            str(x).strip()
+                            for x in (row.get("must_answer_points_cn", []) or [])
+                            if str(x).strip()
+                        ],
+                        planned_evidence=[
+                            str(x).strip()
+                            for x in (row.get("planned_evidence", []) or [])
+                            if str(x).strip()
+                        ],
+                        open_tbd_items=[
+                            str(x).strip()
+                            for x in (row.get("open_tbd_items", []) or [])
+                            if str(x).strip()
+                        ],
+                    )
+                )
+        if not reviewer_response_plans:
+            reviewer_response_plans = self._build_default_reviewer_response_plans(
+                reviewer_summaries,
+                canonical_issues,
+            )
+        else:
+            existing_ids = {
+                self._normalize_reviewer_id(plan.reviewer_id) for plan in reviewer_response_plans
+            }
+            default_plans = self._build_default_reviewer_response_plans(
+                reviewer_summaries,
+                canonical_issues,
+            )
+            for default_plan in default_plans:
+                if self._normalize_reviewer_id(default_plan.reviewer_id) not in existing_ids:
+                    reviewer_response_plans.append(default_plan)
+
+        available_comparison_items = self._build_comparison_items(session.comparison_paths)
+        comparison_item_map = {
+            str(item.get("file_id", "")).strip(): item
+            for item in available_comparison_items
+            if str(item.get("file_id", "")).strip()
+        }
+        gap_attachments = self._build_comparison_pdf_attachments(available_comparison_items)
 
         gap_context = (
             f"[review original text]\n```md\n{session.review_md}\n```\n\n"
-            f"[provided comparison titles]\n```json\n{json.dumps(provided_titles, ensure_ascii=False, indent=2)}\n```"
+            f"[provided comparison items]\n```json\n{json.dumps([{k: v for k, v in item.items() if k != 'path'} for item in available_comparison_items], ensure_ascii=False, indent=2)}\n```"
         )
         gap_text = self._run_prompt(
             "stage1_comparison_gap_detector.yaml",
@@ -368,6 +767,7 @@ class RebuttalService:
             agent_name="stage1_comparison_gap_detector",
             temperature=0.2,
             session=session,
+            attachments=gap_attachments,
         )
         gap_json = self._extract_json(gap_text)
         self._append_progress(session, "Stage1: comparison gap detector completed.")
@@ -383,32 +783,44 @@ class RebuttalService:
                     for x in (item.get("mentioned_by_reviewer", []) or [])
                     if self._normalize_reviewer_id(x)
                 ]
-                if not mentioned:
-                    mentioned = [r.reviewer_id for r in session.reviewers]
+                reviewer_scope = "explicit" if mentioned else "all_due_to_unclear_attribution"
 
-                matched_title = str(item.get("match_provided_title", "")).strip()
-                match_path = ""
-                if matched_title:
-                    match_path = provided_title_to_path.get(self._normalize_title(matched_title), "")
-                if not match_path:
-                    fuzzy = self._fuzzy_match_title(paper_title, list(provided_title_to_path.keys()))
-                    if fuzzy:
-                        match_path = provided_title_to_path.get(fuzzy, "")
+                match_file_id = str(item.get("match_file_id", "")).strip()
+                matched_item = comparison_item_map.get(match_file_id, {})
+                match_path = str(matched_item.get("path", "")).strip()
+                match_source_type = str(matched_item.get("source_type", "")).strip()
+                direct_url = self._verified_direct_url(str(item.get("direct_url", "")).strip(), session.review_md)
+                search_query = " ".join(str(item.get("search_query", "")).split()).strip() or paper_title
+                source_hint = self._normalize_source_hint(str(item.get("source_hint", "")).strip(), direct_url)
 
                 comparison_needs.append(
                     ComparisonNeed(
                         paper_title=paper_title,
                         mentioned_by_reviewer=mentioned,
                         reason=str(item.get("reason", "")).strip(),
-                        provided_md_path=match_path,
+                        reviewer_scope=reviewer_scope,
+                        direct_url=direct_url,
+                        search_query=search_query,
+                        source_hint=source_hint,
+                        provided_file_id=match_file_id,
+                        provided_source_path=match_path,
+                        provided_source_type=match_source_type,
                         status="provided" if match_path else "missing",
                     )
                 )
 
+        comparison_needs = self._auto_resolve_comparison_needs(session, comparison_needs)
+        reviewer_response_plans = self._augment_response_plans_with_comparisons(
+            reviewer_response_plans,
+            comparison_needs,
+        )
+
         stage1_data = {
             "overall_summary": overall_summary,
             "reviewer_summaries": reviewer_summaries,
+            "canonical_issues": canonical_issues,
             "experiment_tasks": [asdict(x) for x in experiment_tasks],
+            "reviewer_response_plans": [asdict(x) for x in reviewer_response_plans],
             "comparison_needs": [asdict(x) for x in comparison_needs],
         }
 
@@ -458,14 +870,63 @@ class RebuttalService:
             if isinstance(x, dict)
         ]
         reviewer_summaries = session.stage1_data.get("reviewer_summaries", []) or []
-        comparison_needs = [
-            ComparisonNeed(**x)
-            for x in (session.stage1_data.get("comparison_needs", []) or [])
-            if isinstance(x, dict)
+        reviewer_response_plans = [
+            ReviewerResponsePlan(
+                reviewer_id=self._normalize_reviewer_id(x.get("reviewer_id", "")),
+                main_position_en=str(x.get("main_position_en", "")).strip(),
+                must_answer_points_cn=[
+                    str(v).strip()
+                    for v in (x.get("must_answer_points_cn", []) or [])
+                    if str(v).strip()
+                ],
+                planned_evidence=[
+                    str(v).strip()
+                    for v in (x.get("planned_evidence", []) or [])
+                    if str(v).strip()
+                ],
+                open_tbd_items=[
+                    str(v).strip()
+                    for v in (x.get("open_tbd_items", []) or [])
+                    if str(v).strip()
+                ],
+            )
+            for x in (session.stage1_data.get("reviewer_response_plans", []) or [])
+            if isinstance(x, dict) and self._normalize_reviewer_id(x.get("reviewer_id", ""))
         ]
+        comparison_needs = [
+            need
+            for x in (session.stage1_data.get("comparison_needs", []) or [])
+            for need in [self._comparison_need_from_dict(x)]
+            if need
+        ]
+        if not reviewer_response_plans:
+            reviewer_response_plans = self._build_default_reviewer_response_plans(
+                reviewer_summaries,
+                session.stage1_data.get("canonical_issues", []) or [],
+            )
+        else:
+            existing_ids = {
+                self._normalize_reviewer_id(plan.reviewer_id) for plan in reviewer_response_plans
+            }
+            default_plans = self._build_default_reviewer_response_plans(
+                reviewer_summaries,
+                session.stage1_data.get("canonical_issues", []) or [],
+            )
+            for default_plan in default_plans:
+                if self._normalize_reviewer_id(default_plan.reviewer_id) not in existing_ids:
+                    reviewer_response_plans.append(default_plan)
+        reviewer_response_plans = self._augment_response_plans_with_comparisons(
+            reviewer_response_plans,
+            comparison_needs,
+        )
 
         user_results = self._parse_experiment_results(experiment_result_paths)
         evidence_by_exp: Dict[str, Dict[str, str]] = {}
+        all_reviewer_ids = [
+            self._normalize_reviewer_id(x.get("reviewer_id", ""))
+            for x in reviewer_summaries
+        ]
+        all_reviewer_ids = [x for x in all_reviewer_ids if x]
 
         for task in tasks:
             exp_id = self._normalize_exp_id(task.exp_id)
@@ -479,8 +940,15 @@ class RebuttalService:
                 source = "auto"
                 self._append_progress(session, f"Stage2: generating [AUTO] result for {exp_id}.")
                 paper_context, paper_attachments = self._build_paper_prompt_context(session, char_limit=60000)
+                task_reviewer_ids = task.related_reviewers or all_reviewer_ids
+                comparison_context, comparison_attachments = self._build_comparison_context_for_task(
+                    task_reviewer_ids,
+                    comparison_needs,
+                    session.comparison_paths,
+                )
                 auto_context = (
                     f"{paper_context}\n\n"
+                    f"[comparison context]\n```md\n{comparison_context}\n```\n\n"
                     f"[experiment task]\n```json\n{json.dumps(asdict(task), ensure_ascii=False, indent=2)}\n```"
                 )
                 result_text = self._run_prompt(
@@ -489,10 +957,9 @@ class RebuttalService:
                     agent_name=f"stage2_auto_result_generator_{exp_id}",
                     temperature=0.4,
                     session=session,
-                    attachments=paper_attachments,
+                    attachments=paper_attachments + comparison_attachments,
                 ).strip()
-                if "[AUTO]" not in result_text:
-                    result_text = f"[AUTO] {result_text}"
+                result_text = self._normalize_auto_result_text(result_text)
 
             evidence_by_exp[exp_id] = {
                 "source": source,
@@ -557,6 +1024,9 @@ class RebuttalService:
         reviewer_summary_map = {
             self._normalize_reviewer_id(x.get("reviewer_id", "")): x for x in reviewer_summaries
         }
+        reviewer_response_plan_map = {
+            self._normalize_reviewer_id(x.reviewer_id): x for x in reviewer_response_plans
+        }
 
         drafts: Dict[str, RebuttalDraft] = {}
         for rid in reviewer_ids:
@@ -571,18 +1041,30 @@ class RebuttalService:
             if not evidence_md_lines:
                 evidence_md_lines.append("- No direct experiment evidence mapped for this reviewer.")
 
-            comparison_context = self._build_comparison_context_for_reviewer(
+            comparison_context, comparison_attachments = self._build_comparison_context_for_reviewer(
                 rid,
                 comparison_needs,
                 session.comparison_paths,
             )
             paper_context, paper_attachments = self._build_paper_prompt_context(session, char_limit=100000)
+            combined_attachments = paper_attachments + comparison_attachments
+            response_plan = reviewer_response_plan_map.get(
+                rid,
+                ReviewerResponsePlan(
+                    reviewer_id=rid,
+                    main_position_en="We will answer the reviewer with direct evidence and a clarified explanation.",
+                    must_answer_points_cn=[],
+                    planned_evidence=[],
+                    open_tbd_items=[],
+                ),
+            )
 
             writer_context = (
                 f"[reviewer id]\n{rid}\n\n"
                 f"{paper_context}\n\n"
                 f"[reviewer raw review]\n```md\n{reviewer_raw_map.get(rid, '')}\n```\n\n"
                 f"[reviewer summary]\n```json\n{json.dumps(reviewer_summary_map.get(rid, {}), ensure_ascii=False, indent=2)}\n```\n\n"
+                f"[reviewer response plan]\n```json\n{json.dumps(asdict(response_plan), ensure_ascii=False, indent=2)}\n```\n\n"
                 f"[experiment evidence]\n```md\n{chr(10).join(evidence_md_lines)}\n```\n\n"
                 f"[comparison context]\n```md\n{comparison_context}\n```"
             )
@@ -592,17 +1074,34 @@ class RebuttalService:
                 agent_name=f"stage2_reviewer_rebuttal_writer_{rid}",
                 temperature=0.35,
                 session=session,
-                attachments=paper_attachments,
+                attachments=combined_attachments,
             ).strip()
 
             if not draft_text:
                 draft_text = f"Response to Reviewer {rid}\n\nQ1: We thank the reviewer for the comments.\nA1: We will provide the missing details in the camera-ready version."
 
-            limited_text, note = self._enforce_5000_limit(draft_text, rid, session=session)
-            char_count = self.count_chars(limited_text)
-            used_auto = "[AUTO]" in limited_text or any(
-                x.get("source") == "auto" for x in evidence_items
+            revised_text = self._run_rebuttal_reviewer(
+                reviewer_id=rid,
+                raw_review_md=reviewer_raw_map.get(rid, ""),
+                response_plan=response_plan,
+                draft_text=draft_text,
+                evidence_md="\n".join(evidence_md_lines),
+                comparison_context=comparison_context,
+                attachments=combined_attachments,
+                session=session,
             )
+            limited_text, note = self._finalize_generated_rebuttal(
+                text=revised_text or draft_text,
+                reviewer_id=rid,
+                raw_review_md=reviewer_raw_map.get(rid, ""),
+                response_plan=response_plan,
+                evidence_md="\n".join(evidence_md_lines),
+                comparison_context=comparison_context,
+                attachments=combined_attachments,
+                session=session,
+            )
+            char_count = self.count_chars(limited_text)
+            used_auto = "[AUTO]" in limited_text
 
             drafts[rid] = RebuttalDraft(
                 reviewer_id=rid,
@@ -635,12 +1134,11 @@ class RebuttalService:
         limited_text, note = self._enforce_5000_limit(text, rid, session=session)
         char_count = self.count_chars(limited_text)
 
-        existing = session.stage2_drafts[rid]
         updated = RebuttalDraft(
             reviewer_id=rid,
             text=limited_text,
             char_count=char_count,
-            used_auto_results=("[AUTO]" in limited_text) or existing.used_auto_results,
+            used_auto_results=("[AUTO]" in limited_text),
             is_within_limit=char_count <= 5000,
             compression_note=note,
         )
@@ -837,6 +1335,316 @@ class RebuttalService:
                 continue
         return None
 
+    def _comparison_need_from_dict(self, item: Dict[str, Any]) -> Optional[ComparisonNeed]:
+        if not isinstance(item, dict):
+            return None
+        paper_title = str(item.get("paper_title", "")).strip()
+        if not paper_title:
+            return None
+        mentioned = [
+            self._normalize_reviewer_id(x)
+            for x in (item.get("mentioned_by_reviewer", []) or [])
+            if self._normalize_reviewer_id(x)
+        ]
+        provided_source_path = str(
+            item.get("provided_source_path", "") or item.get("provided_md_path", "") or ""
+        ).strip()
+        provided_source_type = str(item.get("provided_source_type", "")).strip()
+        if not provided_source_type and provided_source_path:
+            provided_source_type = self._path_source_type(provided_source_path)
+        provided_file_id = str(item.get("provided_file_id", "")).strip()
+        status = str(item.get("status", "")).strip() or ("provided" if provided_source_path else "missing")
+        reviewer_scope = str(item.get("reviewer_scope", "")).strip()
+        if reviewer_scope not in {"explicit", "all_due_to_unclear_attribution"}:
+            reviewer_scope = "explicit" if mentioned else "all_due_to_unclear_attribution"
+        return ComparisonNeed(
+            paper_title=paper_title,
+            mentioned_by_reviewer=mentioned,
+            reason=str(item.get("reason", "")).strip(),
+            reviewer_scope=reviewer_scope,
+            direct_url=str(item.get("direct_url", "")).strip(),
+            search_query=" ".join(str(item.get("search_query", "")).split()).strip(),
+            source_hint=self._normalize_source_hint(str(item.get("source_hint", "")).strip(), str(item.get("direct_url", "")).strip()),
+            provided_file_id=provided_file_id,
+            provided_source_path=provided_source_path,
+            provided_source_type=provided_source_type,
+            retrieval_provider=str(item.get("retrieval_provider", "")).strip(),
+            resolved_url=str(item.get("resolved_url", "")).strip(),
+            retrieval_note=str(item.get("retrieval_note", "")).strip(),
+            status=status,
+        )
+
+    def _comparison_need_target_reviewers(
+        self,
+        need: ComparisonNeed,
+        all_reviewer_ids: List[str],
+    ) -> List[str]:
+        if need.reviewer_scope == "all_due_to_unclear_attribution":
+            return [self._normalize_reviewer_id(rid) for rid in all_reviewer_ids if self._normalize_reviewer_id(rid)]
+
+        targets: List[str] = []
+        seen: set[str] = set()
+        for rid in need.mentioned_by_reviewer:
+            norm_rid = self._normalize_reviewer_id(rid)
+            if not norm_rid or norm_rid in seen:
+                continue
+            seen.add(norm_rid)
+            targets.append(norm_rid)
+        return targets
+
+    def _comparison_scope_note(self, need: ComparisonNeed) -> str:
+        if need.reviewer_scope == "all_due_to_unclear_attribution":
+            return "Reviewer attribution is unclear in the review text, so this paper is shared with all reviewers."
+        return ""
+
+    def _build_comparison_context(
+        self,
+        target_reviewer_ids: List[str],
+        comparison_needs: List[ComparisonNeed],
+        comparison_paths: List[str],
+        empty_message: str,
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        normalized_targets: List[str] = []
+        seen_targets: set[str] = set()
+        for reviewer_id in target_reviewer_ids:
+            norm_rid = self._normalize_reviewer_id(reviewer_id)
+            if not norm_rid or norm_rid in seen_targets:
+                continue
+            seen_targets.add(norm_rid)
+            normalized_targets.append(norm_rid)
+        if not normalized_targets:
+            return empty_message, []
+
+        available_items = self._build_comparison_items(comparison_paths)
+        item_by_file_id = {
+            str(item.get("file_id", "")).strip(): item
+            for item in available_items
+            if str(item.get("file_id", "")).strip()
+        }
+        item_by_norm_title: Dict[str, Dict[str, str]] = {}
+        for item in available_items:
+            norm_title = self._normalize_title(item.get("display_name", ""))
+            if norm_title:
+                item_by_norm_title[norm_title] = item
+
+        lines: List[str] = []
+        attachments: List[Dict[str, Any]] = []
+        attached_paths: set[str] = set()
+        for need in comparison_needs:
+            need_targets = self._comparison_need_target_reviewers(need, normalized_targets)
+            matched_targets = [rid for rid in normalized_targets if rid in need_targets]
+            if not matched_targets:
+                continue
+
+            lines.append(f"- Mentioned paper: {need.paper_title}")
+            if need.reason:
+                lines.append(f"  reason: {need.reason}")
+            if len(normalized_targets) > 1:
+                lines.append(f"  relevant_reviewers: {', '.join(matched_targets)}")
+            scope_note = self._comparison_scope_note(need)
+            if scope_note:
+                lines.append(f"  attribution_note: {scope_note}")
+
+            matched_item: Dict[str, str] = {}
+            if need.provided_file_id:
+                matched_item = item_by_file_id.get(need.provided_file_id, {})
+            if not matched_item and need.provided_source_path:
+                for item in available_items:
+                    if item.get("path") == need.provided_source_path:
+                        matched_item = item
+                        break
+            if not matched_item:
+                fuzzy = self._fuzzy_match_title(need.paper_title, list(item_by_norm_title.keys()))
+                if fuzzy:
+                    matched_item = item_by_norm_title.get(fuzzy, {})
+
+            source_path = str(matched_item.get("path", "")).strip()
+            source_type = str(matched_item.get("source_type", "")).strip()
+            display_name = str(matched_item.get("display_name", "")).strip() or os.path.basename(source_path)
+            file_id = str(matched_item.get("file_id", "")).strip()
+
+            if source_path and os.path.exists(source_path) and source_type == "md":
+                paper_md = self._read_text_safe(source_path)
+                excerpt = paper_md[:1800].strip()
+                lines.append(f"  provided_md: yes ({os.path.basename(source_path)})")
+                lines.append(f"  excerpt: {excerpt}")
+            elif source_path and os.path.exists(source_path) and source_type == "pdf":
+                if source_path not in attached_paths:
+                    pdf_attachments = self._build_comparison_pdf_attachments([matched_item])
+                    attachments.extend(pdf_attachments)
+                    attached_paths.add(source_path)
+                lines.append(f"  provided_pdf: yes ({display_name})")
+                if file_id:
+                    lines.append(f"  file_id: {file_id}")
+                lines.append("  note: Use only the attached comparison PDF for claims about this paper.")
+            else:
+                lines.append("  provided_md: no")
+                lines.append(
+                    f"  note: [lack] Comparison material for {need.paper_title} is unavailable in the current session."
+                )
+                lines.append(
+                    "  instruction: Keep the response high-level, state the material gap explicitly, and avoid unsupported paper-specific claims."
+                )
+                if need.retrieval_note:
+                    lines.append(f"  retrieval_note: {need.retrieval_note}")
+                if need.direct_url:
+                    lines.append(f"  direct_url: {need.direct_url}")
+                elif need.resolved_url:
+                    lines.append(f"  resolved_url: {need.resolved_url}")
+            lines.append("")
+
+        if not lines:
+            return empty_message, []
+        return "\n".join(lines).strip(), attachments
+
+    def _build_comparison_context_for_task(
+        self,
+        related_reviewers: List[str],
+        comparison_needs: List[ComparisonNeed],
+        comparison_paths: List[str],
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        return self._build_comparison_context(
+            target_reviewer_ids=related_reviewers,
+            comparison_needs=comparison_needs,
+            comparison_paths=comparison_paths,
+            empty_message="No reviewer-relevant comparison-paper request was detected for this experiment.",
+        )
+
+    def _normalize_auto_result_text(self, text: str) -> str:
+        content = (text or "").strip()
+        if not content:
+            return ""
+
+        content = re.sub(r"\[\s*(?i:auto)\s*\]", "[AUTO]", content)
+        number_pattern = re.compile(r"(?<![A-Za-z0-9_])([+-]?\d+(?:\.\d+)?(?:%|x)?)(?![A-Za-z0-9_]|\s*\[AUTO\])")
+        normalized_lines: List[str] = []
+        for raw_line in content.splitlines():
+            line = raw_line.rstrip()
+            if not line.strip():
+                continue
+            line = re.sub(r"(?:\s*\[AUTO\]){2,}", "[AUTO]", line)
+            if "[AUTO]" in line:
+                line = number_pattern.sub(lambda m: f"{m.group(1)}[AUTO]", line)
+            normalized_lines.append(line)
+        return "\n".join(normalized_lines).strip()
+
+    def _build_default_canonical_issues(
+        self,
+        reviewer_summaries: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        issues: List[Dict[str, Any]] = []
+        issue_idx = 1
+        for row in reviewer_summaries:
+            rid = self._normalize_reviewer_id(row.get("reviewer_id", ""))
+            if not rid:
+                continue
+            requests = [str(x).strip() for x in (row.get("requested_experiments", []) or []) if str(x).strip()]
+            for request in requests:
+                issues.append(
+                    {
+                        "issue_id": f"ISSUE{issue_idx}",
+                        "related_reviewers": [rid],
+                        "category": "experiment",
+                        "summary_cn": request,
+                        "evidence_quotes": [],
+                        "needs_new_evidence": True,
+                    }
+                )
+                issue_idx += 1
+            for point in [str(x).strip() for x in (row.get("main_points", []) or []) if str(x).strip()]:
+                lowered = point.lower()
+                category = "clarification"
+                if any(token in lowered for token in ["compare", "baseline", "ablation", "experiment"]):
+                    category = "experiment"
+                elif any(token in lowered for token in ["novel", "similar", "citation", "paper"]):
+                    category = "comparison"
+                elif any(token in lowered for token in ["clarity", "writing", "presentation", "wording"]):
+                    category = "writing"
+                issues.append(
+                    {
+                        "issue_id": f"ISSUE{issue_idx}",
+                        "related_reviewers": [rid],
+                        "category": category,
+                        "summary_cn": point,
+                        "evidence_quotes": [],
+                        "needs_new_evidence": category in {"experiment", "comparison"},
+                    }
+                )
+                issue_idx += 1
+        return issues
+
+    def _build_default_reviewer_response_plans(
+        self,
+        reviewer_summaries: List[Dict[str, Any]],
+        canonical_issues: List[Dict[str, Any]],
+    ) -> List[ReviewerResponsePlan]:
+        issues_by_reviewer: Dict[str, List[Dict[str, Any]]] = {}
+        for item in canonical_issues:
+            if not isinstance(item, dict):
+                continue
+            for rid in item.get("related_reviewers", []) or []:
+                norm_rid = self._normalize_reviewer_id(rid)
+                if norm_rid:
+                    issues_by_reviewer.setdefault(norm_rid, []).append(item)
+
+        plans: List[ReviewerResponsePlan] = []
+        for row in reviewer_summaries:
+            rid = self._normalize_reviewer_id(row.get("reviewer_id", ""))
+            if not rid:
+                continue
+            must_answer = [str(x).strip() for x in (row.get("main_points", []) or []) if str(x).strip()]
+            if not must_answer:
+                must_answer = [
+                    str(item.get("summary_cn", "")).strip()
+                    for item in issues_by_reviewer.get(rid, [])
+                    if str(item.get("summary_cn", "")).strip()
+                ]
+            planned_evidence = [str(x).strip() for x in (row.get("requested_experiments", []) or []) if str(x).strip()]
+            open_tbd: List[str] = []
+            for item in issues_by_reviewer.get(rid, []):
+                if item.get("needs_new_evidence"):
+                    summary_cn = str(item.get("summary_cn", "")).strip()
+                    if summary_cn:
+                        open_tbd.append(summary_cn)
+            plans.append(
+                ReviewerResponsePlan(
+                    reviewer_id=rid,
+                    main_position_en="We will answer the reviewer with direct evidence and a clarified explanation.",
+                    must_answer_points_cn=must_answer[:6],
+                    planned_evidence=planned_evidence[:6],
+                    open_tbd_items=open_tbd[:6],
+                )
+            )
+        return plans
+
+    def _augment_response_plans_with_comparisons(
+        self,
+        plans: List[ReviewerResponsePlan],
+        comparison_needs: List[ComparisonNeed],
+    ) -> List[ReviewerResponsePlan]:
+        by_reviewer = {self._normalize_reviewer_id(plan.reviewer_id): plan for plan in plans}
+        all_reviewer_ids = list(by_reviewer.keys())
+        for need in comparison_needs:
+            summary = f"对比论文：{need.paper_title}"
+            scope_note = self._comparison_scope_note(need)
+            for norm_rid in self._comparison_need_target_reviewers(need, all_reviewer_ids):
+                if norm_rid not in by_reviewer:
+                    continue
+                plan = by_reviewer[norm_rid]
+                if summary not in plan.must_answer_points_cn:
+                    plan.must_answer_points_cn.append(summary)
+                if need.reason:
+                    evidence_hint = f"说明差异点：{need.reason}"
+                    if evidence_hint not in plan.planned_evidence:
+                        plan.planned_evidence.append(evidence_hint)
+                if scope_note and scope_note not in plan.planned_evidence:
+                    plan.planned_evidence.append(scope_note)
+                if need.status not in {"provided", "downloaded"}:
+                    missing_hint = f"待补对比材料：{need.paper_title}"
+                    if missing_hint not in plan.open_tbd_items:
+                        plan.open_tbd_items.append(missing_hint)
+        return list(by_reviewer.values())
+
     def _normalize_reviewer_id(self, reviewer_id: str) -> str:
         text = (reviewer_id or "").strip().upper()
         if not text:
@@ -973,53 +1781,27 @@ class RebuttalService:
         reviewer_id: str,
         comparison_needs: List[ComparisonNeed],
         comparison_paths: List[str],
-    ) -> str:
-        rid = self._normalize_reviewer_id(reviewer_id)
-        if not rid:
-            return ""
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        return self._build_comparison_context(
+            target_reviewer_ids=[reviewer_id],
+            comparison_needs=comparison_needs,
+            comparison_paths=comparison_paths,
+            empty_message="No reviewer-specific comparison-paper request was detected.",
+        )
 
-        available_title_to_path: Dict[str, str] = {}
-        for path in comparison_paths:
-            if not os.path.exists(path):
-                continue
-            title = self._extract_title_from_markdown(self._read_text_safe(path), os.path.basename(path))
-            available_title_to_path[self._normalize_title(title)] = path
-
-        lines: List[str] = []
-        for need in comparison_needs:
-            if rid not in [self._normalize_reviewer_id(x) for x in need.mentioned_by_reviewer]:
-                continue
-
-            lines.append(f"- Mentioned paper: {need.paper_title}")
-            if need.reason:
-                lines.append(f"  reason: {need.reason}")
-
-            source_path = need.provided_md_path
-            if not source_path:
-                fuzzy = self._fuzzy_match_title(need.paper_title, list(available_title_to_path.keys()))
-                if fuzzy:
-                    source_path = available_title_to_path.get(fuzzy, "")
-
-            if source_path and os.path.exists(source_path):
-                paper_md = self._read_text_safe(source_path)
-                excerpt = paper_md[:1800].strip()
-                lines.append(f"  provided_md: yes ({os.path.basename(source_path)})")
-                lines.append(f"  excerpt: {excerpt}")
-            else:
-                lines.append("  provided_md: no")
-                lines.append("  note: Comparison paper markdown is missing; keep response high-level and request concrete paper evidence from author if needed.")
-
-        if not lines:
-            return "No reviewer-specific comparison-paper request was detected."
-        return "\n".join(lines)
-
-    def _enforce_5000_limit(self, text: str, reviewer_id: str, session: Optional[SessionState] = None) -> Tuple[str, str]:
+    def _compress_rebuttal_text(
+        self,
+        text: str,
+        reviewer_id: str,
+        session: Optional[SessionState] = None,
+        rounds: int = 2,
+    ) -> Tuple[str, str]:
         content = (text or "").strip()
         if len(content) <= 5000:
             return content, ""
 
         note = ""
-        for i in range(2):
+        for i in range(rounds):
             compress_context = (
                 f"[target character limit]\n5000\n\n"
                 f"[reviewer id]\n{reviewer_id}\n\n"
@@ -1047,6 +1829,122 @@ class RebuttalService:
         keep = max(0, 5000 - len(suffix))
         content = content[:keep].rstrip() + suffix
         return content, "Compressed and hard-truncated to satisfy 5000-character limit."
+
+    def _run_rebuttal_reviewer(
+        self,
+        reviewer_id: str,
+        raw_review_md: str,
+        response_plan: ReviewerResponsePlan,
+        draft_text: str,
+        evidence_md: str,
+        comparison_context: str,
+        attachments: List[Dict[str, Any]],
+        session: Optional[SessionState] = None,
+        target_limit: Optional[int] = None,
+        pass_name: str = "main",
+    ) -> str:
+        context = (
+            f"[reviewer id]\n{reviewer_id}\n\n"
+            f"[reviewer raw review]\n```md\n{raw_review_md}\n```\n\n"
+            f"[reviewer response plan]\n```json\n{json.dumps(asdict(response_plan), ensure_ascii=False, indent=2)}\n```\n\n"
+            f"[writer draft]\n```md\n{draft_text}\n```\n\n"
+            f"[experiment evidence]\n```md\n{evidence_md}\n```\n\n"
+            f"[comparison context]\n```md\n{comparison_context}\n```"
+        )
+        if target_limit is not None:
+            context += f"\n\n[target character limit]\n{int(target_limit)}"
+        revised = self._run_prompt(
+            "stage2_rebuttal_reviewer.yaml",
+            context,
+            agent_name=f"stage2_rebuttal_reviewer_{reviewer_id}_{pass_name}",
+            temperature=0.2,
+            session=session,
+            attachments=attachments,
+        ).strip()
+        return revised or (draft_text or "").strip()
+
+    def _ensure_required_comparison_markers(
+        self,
+        text: str,
+        comparison_context: str,
+    ) -> Tuple[str, str]:
+        content = (text or "").strip()
+        lack_lines = [line.strip() for line in (comparison_context or "").splitlines() if "[lack]" in line]
+        if lack_lines and "[lack]" not in content:
+            marker_line = re.sub(r"^note:\s*", "", lack_lines[0], flags=re.IGNORECASE).strip()
+            if content:
+                content = f"{content}\n\n{marker_line}"
+            else:
+                content = marker_line
+            return content, "Inserted missing [lack] marker."
+        return content, ""
+
+    def _finalize_generated_rebuttal(
+        self,
+        text: str,
+        reviewer_id: str,
+        raw_review_md: str,
+        response_plan: ReviewerResponsePlan,
+        evidence_md: str,
+        comparison_context: str,
+        attachments: List[Dict[str, Any]],
+        session: Optional[SessionState] = None,
+    ) -> Tuple[str, str]:
+        content = (text or "").strip()
+        notes: List[str] = []
+        content, marker_note = self._ensure_required_comparison_markers(content, comparison_context)
+        if marker_note:
+            notes.append(marker_note)
+        if len(content) <= 5000:
+            return content, " ".join(notes).strip()
+
+        compressed, compress_note = self._compress_rebuttal_text(
+            content,
+            reviewer_id,
+            session=session,
+            rounds=2,
+        )
+        content = compressed
+        if compress_note:
+            notes.append(compress_note)
+
+        if len(content) > 5000:
+            return content, " ".join(notes).strip()
+
+        repaired = self._run_rebuttal_reviewer(
+            reviewer_id=reviewer_id,
+            raw_review_md=raw_review_md,
+            response_plan=response_plan,
+            draft_text=content,
+            evidence_md=evidence_md,
+            comparison_context=comparison_context,
+            attachments=attachments,
+            session=session,
+            target_limit=5000,
+            pass_name="limit_repair",
+        )
+        if repaired and repaired != content:
+            content = repaired
+            notes.append("Post-compression review rewrite applied.")
+
+        content, marker_note = self._ensure_required_comparison_markers(content, comparison_context)
+        if marker_note:
+            notes.append(marker_note)
+
+        if len(content) > 5000:
+            content, final_note = self._compress_rebuttal_text(
+                content,
+                reviewer_id,
+                session=session,
+                rounds=1,
+            )
+            if final_note:
+                notes.append(final_note)
+
+        return content, " ".join(notes).strip()
+
+    def _enforce_5000_limit(self, text: str, reviewer_id: str, session: Optional[SessionState] = None) -> Tuple[str, str]:
+        return self._compress_rebuttal_text(text, reviewer_id, session=session, rounds=2)
 
     def _reviewer_sort_key(self, reviewer_id: str) -> Tuple[int, str]:
         rid = self._normalize_reviewer_id(reviewer_id)

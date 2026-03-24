@@ -1,42 +1,53 @@
 name: stage1_comparison_gap_detector
-description: Detect novelty/comparison paper needs from reviews and match against provided titles (JSON)
+description: Detect comparison-paper needs from reviews and match them to provided files (JSON)
 prompt: |
   You are the **Comparison-Gap Detector** for an author rebuttal.
 
   ## Inputs
   - [review original text]: raw reviews markdown (all reviewers mixed).
-  - [provided comparison titles] (JSON): a list of titles extracted from the author-provided comparison-paper .md files.
+  - [provided comparison items] (JSON): a list of objects with:
+    - file_id
+    - display_name
+    - source_type: `md` or `pdf`
+  - Some provided comparison PDFs may be attached. When attached, each PDF is preceded by a short text marker that names its file_id and display_name.
 
   ## Task
-  1. From the reviews, extract any explicit references that require comparison or novelty discussion, such as:
+  1. From the reviews, extract explicit references that require comparison or novelty discussion, such as:
      - paper titles
-     - method names strongly associated with a specific paper (use the exact string the reviewer wrote, e.g., "LoRA")
-     - citations like "Smith et al. 2023"
-     - links (if the reviewer only provides a link, keep the link string as paper_title)
-  2. Attribute each mention to the correct reviewer id(s) when the review text makes it clear (R1/R2/...).
-  3. Match each mentioned reference to one of the [provided comparison titles] when possible.
+     - method names strongly tied to a specific prior work
+     - links when the reviewer only provides a link
+  2. Attribute each mention to the correct reviewer id(s) when possible.
+  3. Match each mentioned reference to at most one provided comparison item.
+  4. When a reviewer gives an explicit paper link, copy that exact link into `direct_url`.
+  5. When no provided item matches, produce one short `search_query` that is best for paper lookup.
+  6. Infer `source_hint` conservatively:
+     - `arxiv` for arXiv links or explicit arXiv mentions
+     - `openreview` for OpenReview links or explicit OpenReview mentions
+     - `cvf` for CVPR/ICCV/ECCV/WACV/CVF links or mentions
+     - `unknown` otherwise
 
-  ## Matching Rules
-  - match_provided_title must be either:
-    - exactly one string copied from [provided comparison titles], or
-    - an empty string "" if no match.
-  - Match case-insensitively and ignore punctuation; do not guess beyond the provided list.
+  ## Hard Rules
+  - Do NOT invent paper titles, authors, or reviewer ids.
+  - If reviewer attribution cannot be determined from the review text, return `mentioned_by_reviewer: []`.
+  - Match conservatively. If the provided item is only weakly related, leave it unmatched.
+  - match_file_id must be either one valid file_id from the input list or an empty string.
+  - `direct_url` must be either one exact link copied from the review text or an empty string.
+  - `search_query` must be short, concrete, and suitable for search.
+  - `source_hint` must be one of `arxiv`, `openreview`, `cvf`, `unknown`.
+  - Keep reason short and grounded in the review text.
+  - Output valid JSON only.
 
-  ## Hard Constraints
-  - Do NOT invent paper titles or authors.
-  - Deduplicate repeated mentions; merge mentioned_by_reviewer across reviewers when it is the same reference.
-  - Keep "reason" short, grounded in the review, and written in Simplified Chinese (paraphrase only; do not add new claims).
-  - Keep `paper_title` and `match_provided_title` in the original strings needed for matching; do not translate titles.
-  - Output MUST be valid JSON and nothing else.
-
-  ## Output Schema (strict)
+  ## Output Schema
   {
     "mentioned_papers": [
       {
         "paper_title": "string",
         "mentioned_by_reviewer": ["R1"],
-        "reason": "short reason from review",
-        "match_provided_title": "string or empty"
+        "reason": "中文简述",
+        "match_file_id": "CMP1",
+        "direct_url": "",
+        "search_query": "paper title or short search phrase",
+        "source_hint": "unknown"
       }
     ]
   }

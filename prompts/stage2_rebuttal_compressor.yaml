@@ -14,7 +14,7 @@ prompt: |
   - Preserve:
     - the header `Response to Reviewer <ID>`
     - Q/A coverage (do not drop any Q entirely)
-    - all technical claims and any evidence markers like [AUTO]
+    - all technical claims and any evidence markers like [AUTO] or [lack]
   - Do NOT add new facts, numbers, or experiments.
   - Remove redundancy and filler first.
   - Keep Q/A numbering stable (Q1/A1, Q2/A2, ...).

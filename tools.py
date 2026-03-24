@@ -10,10 +10,14 @@ import json
 import time
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from html import unescape
 import urllib.request
 import urllib.parse
+import urllib.error
 import threading
-from arxiv import _fetch_metadata_by_id
+from typing import Any, Dict, List, Optional, Tuple
+
+from arxiv import resolve_arxiv_paper
 
 try:
     if hasattr(sys.stdout, "reconfigure"):
@@ -23,6 +27,23 @@ except Exception:
 
 ARXIV_DIRECT_OPENER = urllib.request.build_opener()
 ARXIV_HOSTS = {"arxiv.org", "www.arxiv.org", "export.arxiv.org"}
+OPENREVIEW_HOSTS = {"openreview.net", "www.openreview.net", "api2.openreview.net"}
+CVF_HOSTS = {"openaccess.thecvf.com", "www.openaccess.thecvf.com"}
+CVF_BASE_URL = "https://openaccess.thecvf.com"
+DEFAULT_DOWNLOAD_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/pdf,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+_OPENREVIEW_CLIENT_CACHE: Dict[Tuple[str, str, str], Any] = {}
+_CVF_QUERY_CACHE: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
             
 PDF_CONVERT_LOCK = threading.Lock()
 
@@ -436,6 +457,518 @@ def fetch_openreview_reviews_markdown(openreview_url: str) -> str:
         raise ValueError("No Official_Review/Meta_Review notes found for this forum.")
     out = "\n".join(md_lines).strip()
     return out + "\n"
+
+
+def _normalize_lookup_title(title: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9 ]+", " ", (title or "").lower())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _title_similarity(query_title: str, candidate_title: str) -> float:
+    query_norm = _normalize_lookup_title(query_title)
+    candidate_norm = _normalize_lookup_title(candidate_title)
+    if not query_norm or not candidate_norm:
+        return 0.0
+    if query_norm == candidate_norm:
+        return 1.0
+    if query_norm in candidate_norm or candidate_norm in query_norm:
+        return 0.9
+    query_tokens = set(query_norm.split())
+    candidate_tokens = set(candidate_norm.split())
+    if not query_tokens or not candidate_tokens:
+        return 0.0
+    return len(query_tokens & candidate_tokens) / max(1, len(query_tokens | candidate_tokens))
+
+
+def _strip_trailing_url_punctuation(url: str) -> str:
+    return (url or "").strip().rstrip(").,;]>}")
+
+
+def _url_hostname(url: str) -> str:
+    try:
+        return (urllib.parse.urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def _absolute_url(base_url: str, path: str) -> str:
+    return urllib.parse.urljoin(base_url, path)
+
+
+def _download_url_bytes(url: str, timeout: int = 60, allow_proxy: bool = True) -> bytes:
+    request_headers = dict(DEFAULT_DOWNLOAD_HEADERS)
+    req = urllib.request.Request(url, headers=request_headers)
+    host = _url_hostname(url)
+    use_direct = (host in ARXIV_HOSTS) or any(host.endswith("." + h) for h in ARXIV_HOSTS)
+    opener_open = ARXIV_DIRECT_OPENER.open if use_direct and allow_proxy else urllib.request.urlopen
+    with opener_open(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _fetch_html_text(url: str, timeout: int = 30) -> str:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": DEFAULT_DOWNLOAD_HEADERS["User-Agent"],
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": DEFAULT_DOWNLOAD_HEADERS["Accept-Language"],
+            "Referer": "https://openreview.net/",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", "ignore")
+
+
+def download_pdf_to_local(
+    pdf_url: str,
+    output_dir: str,
+    file_stem: str,
+    source_label: str = "auto",
+    max_retries: int = 3,
+) -> str:
+    pdf_url = (pdf_url or "").strip()
+    if not pdf_url:
+        raise ValueError("PDF URL is empty.")
+
+    os.makedirs(output_dir, exist_ok=True)
+    safe_stem = _safe_filename(f"{source_label}_{file_stem}".strip("_")) or f"{source_label}_paper"
+    pdf_path = os.path.join(output_dir, f"{safe_stem}.pdf")
+
+    if os.path.exists(pdf_path):
+        try:
+            with open(pdf_path, "rb") as f:
+                if f.read(5) == b"%PDF-":
+                    return pdf_path
+        except Exception:
+            pass
+
+    last_error: Optional[Exception] = None
+    for attempt in range(max_retries):
+        try:
+            if attempt > 0:
+                time.sleep((attempt + 1) * 2 + random.uniform(0.3, 1.0))
+            pdf_data = _download_url_bytes(pdf_url, timeout=60, allow_proxy=True)
+            if len(pdf_data) < 100:
+                raise ValueError(f"Downloaded file is too small: {len(pdf_data)} bytes")
+            if not pdf_data.startswith(b"%PDF-"):
+                raise ValueError(f"Downloaded file is not a valid PDF (header: {pdf_data[:20]!r})")
+            with open(pdf_path, "wb") as f:
+                f.write(pdf_data)
+            return pdf_path
+        except Exception as e:
+            last_error = e
+    raise ValueError(f"PDF download failed after {max_retries} attempts: {last_error}")
+
+
+def _get_openreview_client():
+    try:
+        import openreview
+    except Exception as e:
+        raise ValueError(f"openreview-py is not installed or failed to import: {type(e).__name__}: {e}")
+
+    baseurl = (os.environ.get("OPENREVIEW_BASEURL") or "https://api2.openreview.net").strip()
+    username = (os.environ.get("OPENREVIEW_USERNAME") or "").strip()
+    password = (os.environ.get("OPENREVIEW_PASSWORD") or "").strip()
+    cache_key = (baseurl, username, password)
+    client = _OPENREVIEW_CLIENT_CACHE.get(cache_key)
+    if client is not None:
+        return client
+
+    kwargs = {"baseurl": baseurl}
+    if username and password:
+        kwargs.update({"username": username, "password": password})
+    client = openreview.api.OpenReviewClient(**kwargs)
+    _OPENREVIEW_CLIENT_CACHE[cache_key] = client
+    return client
+
+
+def _openreview_get_attr(obj, key: str, default=None):
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _unwrap_openreview_value(value):
+    if isinstance(value, dict) and "value" in value:
+        return value.get("value")
+    return value
+
+
+def _openreview_note_title(note) -> str:
+    content = _openreview_get_attr(note, "content", {}) or {}
+    if not isinstance(content, dict):
+        return ""
+    title = _unwrap_openreview_value(content.get("title"))
+    return str(title or "").strip()
+
+
+def _public_openreview_url(note_id: str, forum_id: str) -> Tuple[str, str]:
+    note_id = str(note_id or "").strip()
+    forum_id = str(forum_id or note_id).strip()
+    return (
+        f"https://openreview.net/pdf?id={note_id}" if note_id else "",
+        f"https://openreview.net/forum?id={forum_id}" if forum_id else "",
+    )
+
+
+def _openreview_note_to_candidate(note, match_note: str) -> Optional[Dict[str, Any]]:
+    note_id = str(_openreview_get_attr(note, "id", "") or "").strip()
+    forum_id = str(_openreview_get_attr(note, "forum", "") or note_id).strip()
+    replyto = str(_openreview_get_attr(note, "replyto", "") or "").strip()
+    content = _openreview_get_attr(note, "content", {}) or {}
+    title = _openreview_note_title(note)
+    raw_pdf = ""
+    if isinstance(content, dict):
+        raw_pdf = str(_unwrap_openreview_value(content.get("pdf")) or "").strip()
+    pdf_url, forum_url = _public_openreview_url(note_id, forum_id)
+    if raw_pdf:
+        pdf_url = _absolute_url("https://openreview.net", raw_pdf)
+    if replyto and replyto != forum_id and not raw_pdf:
+        return None
+    if not note_id or not title or not pdf_url:
+        return None
+    return {
+        "provider": "openreview",
+        "title": title,
+        "pdf_url": pdf_url,
+        "resolved_url": forum_url or pdf_url,
+        "paper_id": note_id,
+        "forum_id": forum_id,
+        "match_note": match_note,
+    }
+
+
+def _openreview_id_from_url(url: str) -> str:
+    from urllib.parse import parse_qs, urlparse
+
+    parsed = urlparse((url or "").strip())
+    query = parse_qs(parsed.query or "")
+    for key in ("id", "forum", "noteId"):
+        value = (query.get(key, [""]) or [""])[0].strip()
+        if value:
+            return value
+    return ""
+
+
+def _openreview_candidate_from_html(url: str) -> Optional[Dict[str, Any]]:
+    try:
+        html = _fetch_html_text(url, timeout=30)
+    except Exception:
+        return None
+
+    def meta(name: str) -> str:
+        match = re.search(
+            rf'<meta\s+name="{re.escape(name)}"\s+content="([^"]*)"',
+            html,
+            re.IGNORECASE,
+        )
+        return unescape(match.group(1)).strip() if match else ""
+
+    title = meta("citation_title")
+    pdf_url = meta("citation_pdf_url")
+    if not pdf_url:
+        note_id = _openreview_id_from_url(url)
+        if note_id:
+            pdf_url = f"https://openreview.net/pdf?id={note_id}"
+    note_id = _openreview_id_from_url(pdf_url) or _openreview_id_from_url(url)
+    forum_id = _openreview_id_from_url(url) or note_id
+    if not title or not pdf_url:
+        return None
+    return {
+        "provider": "openreview",
+        "title": title,
+        "pdf_url": pdf_url,
+        "resolved_url": f"https://openreview.net/forum?id={forum_id}" if forum_id else url,
+        "paper_id": note_id or forum_id,
+        "forum_id": forum_id,
+        "match_note": "Matched from direct OpenReview link.",
+    }
+
+
+def _search_openreview_notes(term: str) -> List[Any]:
+    term = " ".join((term or "").split()).strip()
+    if not term:
+        return []
+
+    params = {
+        "term": term,
+        "type": "terms",
+        "content": "all",
+        "group": "all",
+        "source": "all",
+        "offset": 0,
+        "limit": 10,
+    }
+    query_url = "https://openreview.net/search?query=" + urllib.parse.quote(term)
+    headers = {
+        "User-Agent": DEFAULT_DOWNLOAD_HEADERS["User-Agent"],
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": DEFAULT_DOWNLOAD_HEADERS["Accept-Language"],
+        "Referer": query_url,
+        "Origin": "https://openreview.net",
+        "X-Url": query_url,
+        "X-Source": "client search",
+    }
+
+    notes: List[Any] = []
+    seen_ids = set()
+    for base in ("https://api2.openreview.net", "https://api.openreview.net"):
+        url = base + "/notes/search?" + urllib.parse.urlencode(params)
+        try:
+            raw = urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=20).read()
+            payload = json.loads(raw.decode("utf-8", "ignore"))
+        except Exception:
+            continue
+        for note in payload.get("notes", []) or []:
+            note_id = str(_openreview_get_attr(note, "id", "") or "").strip()
+            if not note_id or note_id in seen_ids:
+                continue
+            seen_ids.add(note_id)
+            notes.append(note)
+    return notes
+
+
+def resolve_openreview_paper(
+    direct_url: str = "",
+    title: str = "",
+) -> Optional[Dict[str, Any]]:
+    client = _get_openreview_client()
+
+    direct_url = _strip_trailing_url_punctuation(direct_url)
+    if direct_url:
+        note_id = _openreview_id_from_url(direct_url)
+        if note_id:
+            try:
+                note = client.get_note(note_id)
+                candidate = _openreview_note_to_candidate(note, "Matched from direct OpenReview link.")
+                if candidate:
+                    return candidate
+            except Exception:
+                try:
+                    notes = client.get_all_notes(forum=note_id)
+                except Exception:
+                    notes = []
+                for note in notes or []:
+                    candidate = _openreview_note_to_candidate(note, "Matched from direct OpenReview forum link.")
+                    if candidate:
+                        return candidate
+        html_candidate = _openreview_candidate_from_html(direct_url)
+        if html_candidate:
+            return html_candidate
+
+    title = " ".join((title or "").split()).strip()
+    if not title:
+        return None
+
+    best_candidate: Optional[Dict[str, Any]] = None
+    best_score = 0.0
+    for note in _search_openreview_notes(title):
+        candidate = _openreview_note_to_candidate(note, "Matched from OpenReview title search.")
+        if not candidate:
+            continue
+        score = _title_similarity(title, candidate.get("title", ""))
+        if score > best_score:
+            best_candidate = candidate
+            best_score = score
+    if best_candidate and best_score >= 0.9:
+        return best_candidate
+    return None
+
+
+def _cvf_targets(source_hint: str = "", direct_url: str = "") -> List[str]:
+    source_hint = (source_hint or "").strip().lower()
+    direct_url = (direct_url or "").strip()
+    explicit = re.search(r"((?:cvpr|iccv|eccv|wacv)\d{4})", source_hint)
+    if not explicit and direct_url:
+        explicit = re.search(r"/((?:CVPR|ICCV|ECCV|WACV)\d{4})(?:[/?]|$)", direct_url, re.IGNORECASE)
+
+    targets: List[str] = []
+    if explicit:
+        targets.append(explicit.group(1).upper())
+
+    conf_hint_match = re.search(r"\b(cvpr|iccv|eccv|wacv)\b", source_hint)
+    confs = [conf_hint_match.group(1).upper()] if conf_hint_match else ["CVPR", "ICCV", "ECCV", "WACV"]
+    current_year = max(2020, time.localtime().tm_year)
+    years = list(range(current_year, max(2019, current_year - 5), -1))
+
+    for conf in confs:
+        for year in years:
+            conf_year = f"{conf}{year}"
+            if conf_year not in targets:
+                targets.append(conf_year)
+    return targets
+
+
+def _parse_cvf_search_results(conf_year: str, html_text: str) -> List[Dict[str, str]]:
+    entries: List[Dict[str, str]] = []
+    entry_re = re.compile(
+        r'<dt class="ptitle"><br><a href="(?P<html>[^"]+_paper\.html)">(?P<title>.*?)</a></dt>(?P<body>.*?)(?=<dt class="ptitle"|</dl>)',
+        re.DOTALL | re.IGNORECASE,
+    )
+    for match in entry_re.finditer(html_text or ""):
+        title = unescape(re.sub(r"<[^>]+>", "", match.group("title"))).strip()
+        body = match.group("body") or ""
+        pdf_match = re.search(r'href="(?P<pdf>[^"]+_paper\.pdf)"', body, re.IGNORECASE)
+        html_path = match.group("html")
+        pdf_path = pdf_match.group("pdf") if pdf_match else ""
+        if not title or not html_path or not pdf_path:
+            continue
+        entries.append(
+            {
+                "provider": "cvf",
+                "title": title,
+                "resolved_url": _absolute_url(CVF_BASE_URL, html_path),
+                "pdf_url": _absolute_url(CVF_BASE_URL, pdf_path),
+                "paper_id": f"{conf_year}:{os.path.basename(pdf_path)}",
+                "conf_year": conf_year,
+                "match_note": "Matched from CVF title search.",
+            }
+        )
+    return entries
+
+
+def _search_cvf_conf_page(conf_year: str, query: str) -> List[Dict[str, str]]:
+    cache_key = (conf_year, query.lower().strip())
+    cached = _CVF_QUERY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    request_data = urllib.parse.urlencode({"query": query}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{CVF_BASE_URL}/{conf_year}",
+        data=request_data,
+        headers={"User-Agent": DEFAULT_DOWNLOAD_HEADERS["User-Agent"]},
+        method="POST",
+    )
+    html_text = urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "ignore")
+    entries = _parse_cvf_search_results(conf_year, html_text)
+    _CVF_QUERY_CACHE[cache_key] = entries
+    return entries
+
+
+def _extract_title_from_cvf_html(html_url: str) -> str:
+    html_text = urllib.request.urlopen(
+        urllib.request.Request(html_url, headers={"User-Agent": DEFAULT_DOWNLOAD_HEADERS["User-Agent"]}),
+        timeout=30,
+    ).read().decode("utf-8", "ignore")
+    match = re.search(r'<div id="papertitle">\s*(.*?)\s*<dd>', html_text, re.DOTALL | re.IGNORECASE)
+    if match:
+        return unescape(re.sub(r"<[^>]+>", "", match.group(1))).strip()
+    title_match = re.search(r"<title>(.*?)</title>", html_text, re.DOTALL | re.IGNORECASE)
+    if title_match:
+        return unescape(re.sub(r"<[^>]+>", "", title_match.group(1))).strip()
+    return ""
+
+
+def resolve_cvf_paper(
+    direct_url: str = "",
+    title: str = "",
+    source_hint: str = "",
+) -> Optional[Dict[str, Any]]:
+    direct_url = _strip_trailing_url_punctuation(direct_url)
+    host = _url_hostname(direct_url)
+
+    if host in CVF_HOSTS:
+        html_url = ""
+        pdf_url = ""
+        if direct_url.lower().endswith(".pdf"):
+            pdf_url = direct_url
+            html_url = direct_url.replace("/papers/", "/html/").replace("_paper.pdf", "_paper.html")
+        elif direct_url.lower().endswith(".html"):
+            html_url = direct_url
+            pdf_url = direct_url.replace("/html/", "/papers/").replace("_paper.html", "_paper.pdf")
+        else:
+            html_url = direct_url
+        candidate_title = title
+        if html_url:
+            try:
+                fetched_title = _extract_title_from_cvf_html(html_url)
+                if fetched_title:
+                    candidate_title = fetched_title
+            except Exception:
+                pass
+        if pdf_url and candidate_title:
+            return {
+                "provider": "cvf",
+                "title": candidate_title,
+                "pdf_url": pdf_url,
+                "resolved_url": html_url or pdf_url,
+                "paper_id": os.path.basename(pdf_url),
+                "match_note": "Matched from direct CVF link.",
+            }
+
+    title = " ".join((title or "").split()).strip()
+    if not title:
+        return None
+
+    seen = set()
+    best_candidate: Optional[Dict[str, Any]] = None
+    best_score = 0.0
+    for conf_year in _cvf_targets(source_hint=source_hint, direct_url=direct_url):
+        try:
+            entries = _search_cvf_conf_page(conf_year, title)
+        except Exception:
+            continue
+        for entry in entries:
+            key = str(entry.get("resolved_url", ""))
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            score = _title_similarity(title, entry.get("title", ""))
+            if score > best_score:
+                best_candidate = dict(entry)
+                best_score = score
+        if best_score >= 0.95:
+            break
+
+    if best_candidate and best_score >= 0.85:
+        return best_candidate
+    return None
+
+
+def resolve_comparison_paper_candidate(
+    paper_title: str,
+    direct_url: str = "",
+    search_query: str = "",
+    source_hint: str = "unknown",
+) -> Optional[Dict[str, Any]]:
+    paper_title = " ".join((paper_title or "").split()).strip()
+    direct_url = _strip_trailing_url_punctuation(direct_url)
+    search_query = " ".join((search_query or "").split()).strip()
+    source_hint = (source_hint or "").strip().lower() or "unknown"
+
+    direct_host = _url_hostname(direct_url)
+    if direct_url:
+        if direct_host in ARXIV_HOSTS:
+            candidate = resolve_arxiv_paper(direct_url=direct_url, title=paper_title, search_query=search_query)
+            if candidate:
+                return candidate
+        if direct_host in OPENREVIEW_HOSTS:
+            candidate = resolve_openreview_paper(direct_url=direct_url, title=paper_title)
+            if candidate:
+                return candidate
+        if direct_host in CVF_HOSTS:
+            candidate = resolve_cvf_paper(direct_url=direct_url, title=paper_title, source_hint=source_hint)
+            if candidate:
+                return candidate
+
+    provider_order = ["arxiv", "openreview", "cvf"]
+    if source_hint in {"arxiv", "openreview", "cvf"}:
+        provider_order = [source_hint] + [x for x in provider_order if x != source_hint]
+
+    for provider in provider_order:
+        if provider == "arxiv":
+            candidate = resolve_arxiv_paper(title=paper_title, search_query=search_query)
+        elif provider == "openreview":
+            candidate = resolve_openreview_paper(title=paper_title)
+        else:
+            candidate = resolve_cvf_paper(title=paper_title, source_hint=source_hint)
+        if candidate:
+            return candidate
+    return None
+
+
 def _safe_filename(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*]+', '_', name)[:100]
 

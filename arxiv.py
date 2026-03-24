@@ -581,3 +581,105 @@ def _fetch_metadata_by_id(arxiv_id: str) -> Optional[Dict]:
         }
     except Exception:
         return None
+
+
+def _normalize_match_title(title: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9 ]+", " ", (title or "").lower())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _title_match_score(query_title: str, candidate_title: str) -> float:
+    query_norm = _normalize_match_title(query_title)
+    candidate_norm = _normalize_match_title(candidate_title)
+    if not query_norm or not candidate_norm:
+        return 0.0
+    if query_norm == candidate_norm:
+        return 1.0
+    if query_norm in candidate_norm or candidate_norm in query_norm:
+        return 0.9
+
+    query_tokens = set(query_norm.split())
+    candidate_tokens = set(candidate_norm.split())
+    if not query_tokens or not candidate_tokens:
+        return 0.0
+    return len(query_tokens & candidate_tokens) / max(1, len(query_tokens | candidate_tokens))
+
+
+def search_arxiv_paper_by_title(title: str, max_results: int = 5) -> List[Dict]:
+    title = " ".join((title or "").split()).strip()
+    if not title:
+        return []
+
+    agent = ArxivAgent(max_results=max_results)
+    seen: Dict[str, Dict] = {}
+    queries = [
+        f'ti:"{title.replace(chr(34), " ")}"',
+        f'all:"{title.replace(chr(34), " ")}"',
+        f'all:{title}',
+    ]
+
+    for query in queries:
+        try:
+            results = agent._search_arxiv(query, max_results=max(10, max_results * 3))
+        except Exception:
+            results = []
+        for paper in results:
+            key = str(paper.get("abs_url", "") or paper.get("arxiv_id", "")).strip()
+            if not key:
+                continue
+            current = seen.get(key)
+            score = _title_match_score(title, str(paper.get("title", "")))
+            paper_copy = dict(paper)
+            paper_copy["title_match_score"] = score
+            if current is None or score > float(current.get("title_match_score", 0.0)):
+                seen[key] = paper_copy
+
+    ranked = sorted(
+        seen.values(),
+        key=lambda x: (
+            float(x.get("title_match_score", 0.0)),
+            str(x.get("published", "")),
+        ),
+        reverse=True,
+    )
+    return ranked[:max_results]
+
+
+def resolve_arxiv_paper(
+    direct_url: str = "",
+    title: str = "",
+    search_query: str = "",
+) -> Optional[Dict]:
+    direct_url = (direct_url or "").strip()
+    if direct_url:
+        arxiv_id = _extract_arxiv_id_from_url(direct_url)
+        if arxiv_id:
+            paper = _fetch_metadata_by_id(arxiv_id)
+            if paper:
+                paper = dict(paper)
+                paper["provider"] = "arxiv"
+                paper["resolved_url"] = paper.get("abs_url") or direct_url
+                paper["paper_id"] = paper.get("arxiv_id", "")
+                paper["match_note"] = "Matched from direct arXiv link."
+                return paper
+
+    title = " ".join((title or "").split()).strip()
+    candidates = search_arxiv_paper_by_title(title, max_results=5) if title else []
+    if not candidates and search_query:
+        candidates = search_relevant_papers(search_query, max_results=5)
+        candidates = [
+            {**paper, "title_match_score": _title_match_score(title or search_query, str(paper.get("title", "")))}
+            for paper in candidates
+        ]
+
+    for candidate in candidates:
+        if float(candidate.get("title_match_score", 0.0)) < 0.75:
+            continue
+        paper = dict(candidate)
+        paper["provider"] = "arxiv"
+        paper["resolved_url"] = paper.get("abs_url", "")
+        paper["paper_id"] = paper.get("arxiv_id", "")
+        paper["match_note"] = "Matched from arXiv title search."
+        return paper
+    return None

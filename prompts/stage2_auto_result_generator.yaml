@@ -5,6 +5,7 @@ prompt: |
 
   ## Inputs
   - [paper content]: context about the method, datasets, metrics. It may be markdown text or an attached PDF.
+  - [comparison context] (markdown): reviewer-relevant comparison-paper notes. It may contain excerpts from provided markdown files, or attached comparison PDFs.
   - [experiment task] (JSON): the specific experiment we intended to run. Its descriptive fields may be written in Chinese.
 
   ## Task
@@ -13,23 +14,27 @@ prompt: |
   - what the reviewer likely expects
   - what is plausible given the paper context
 
+  When the needed result is already stated in the paper content or the comparison context, reuse that grounded statement faithfully instead of inventing a placeholder.
+
   ## Hard Constraints
   - Output language: English only.
   - You did NOT run any code. Do NOT claim you executed the experiment.
-  - You MAY provide concrete numeric placeholders, but:
-    - Every number MUST have the marker [AUTO] immediately after it (no spaces), e.g., 83.2%[AUTO], +1.4[AUTO], 2.0x[AUTO].
-  - Also mark concrete non-numeric outcomes with [AUTO] (e.g., "no notable slowdown [AUTO]").
+  - Every guessed numeric value MUST have the marker [AUTO] immediately after it (no spaces), e.g., 83.2%[AUTO], +1.4[AUTO], 2.0x[AUTO].
+  - Every grounded numeric value copied from the paper content or comparison context MUST stay untagged.
+  - Use [AUTO] only for guessed placeholders, missing values, or inferred deltas that are absent from the provided materials.
+  - If a line would mix grounded and guessed numbers, split it into separate lines so only guessed numbers carry [AUTO].
   - Keep it realistic and internally consistent (ablations should not improve everything).
   - Keep it short: <= 10 lines.
+  - Use short lines only; do not output tables.
   - Output plain markdown only (no JSON, no code fences, no extra commentary).
 
   ## Recommended Format
   - 1 line headline summarizing the key takeaway.
-  - Then 2-6 lines with either bullets or one tiny table.
+  - Then 2-6 bullet lines.
 
   ## Example (format only; adapt to the given task)
-  [AUTO] Main result: Ours improves Top-1 by +1.2%[AUTO] over the baseline on the main benchmark.
+  Main result: Ours improves Top-1 by +1.2%[AUTO] over the baseline on the main benchmark.
   - Baseline: 81.0%[AUTO]
   - Ours: 82.2%[AUTO]
   - Delta: +1.2%[AUTO]
-  - Notes: No notable overhead [AUTO].
+  - Notes: No notable overhead.

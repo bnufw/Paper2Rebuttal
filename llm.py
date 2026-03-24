@@ -245,6 +245,9 @@ class LLMClient:
             for attachment in attachments:
                 if attachment.get("type") != "bytes":
                     raise ValueError(f"Unsupported Gemini attachment type: {attachment.get('type')}")
+                lead_text = str(attachment.get("lead_text", "") or "").strip()
+                if lead_text:
+                    contents.append(lead_text)
                 mime_type = str(attachment.get("mime_type", "") or "").strip()
                 data = attachment.get("data")
                 if not mime_type or not isinstance(data, (bytes, bytearray)):
