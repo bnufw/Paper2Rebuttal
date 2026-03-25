@@ -507,10 +507,30 @@ def _latex_to_markdown_basic(tex: str) -> str:
 
 
 
-def search_relevant_papers(query: str, max_results: int = 30) -> List[Dict]:
-    print(f"[DEBUG] search_relevant_papers called, query: '{query}', max_results={max_results}")
+def search_relevant_papers(query: str, max_results: int = 30, field: str = "all") -> List[Dict]:
+    print(f"[DEBUG] search_relevant_papers called, query: '{query}', max_results={max_results}, field={field}")
     agent = ArxivAgent(max_results=max_results)
-    ranked = agent.search_and_analyze(query)
+    field_key = (field or "all").strip().lower()
+
+    if field_key == "all":
+        ranked = agent.search_and_analyze(query)
+    else:
+        field_map = {
+            "title": "ti",
+            "abstract": "abs",
+        }
+        prefix = field_map.get(field_key, "all")
+        query_text = (query or "").replace('"', " ").strip()
+        if not query_text:
+            return []
+        if " " in query_text:
+            search_query = f'{prefix}:"{query_text}"'
+        else:
+            search_query = f"{prefix}:{query_text}"
+        ranked = agent._search_arxiv(search_query, max_results=max_results)
+        for paper in ranked:
+            paper["relevance_score"] = 1.0
+
     print(f"[DEBUG] search_relevant_papers returning {len(ranked)} papers")
     return ranked[:max_results]
 

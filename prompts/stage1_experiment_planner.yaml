@@ -5,6 +5,7 @@ prompt: |
 
   ## Inputs
   - [paper content]: the paper content. It may be markdown text or an attached PDF.
+  - [review original text]: raw reviews markdown (all reviewers).
   - [reviewer summaries] (JSON): per-reviewer summaries and requested experiments.
 
   ## Goal
@@ -27,6 +28,7 @@ prompt: |
   ## Hard Constraints
   - Do NOT claim any new experiment is already done.
   - Do NOT fabricate exact result numbers here (save numbers for Stage2 AUTO if needed).
+  - Use [review original text] to preserve reviewer nuance and exact wording when needed, but use [reviewer summaries] as the structured checklist of reviewer requests.
   - All natural-language fields MUST be written in Simplified Chinese, except exp_id and reviewer ids.
   - Method names, dataset names, metric names, and result-file headers like `EXP1` may stay in their original form when needed.
   - Each task MUST include:

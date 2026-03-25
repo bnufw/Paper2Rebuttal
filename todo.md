@@ -5,3 +5,6 @@
 2.对于第一阶段，只能传入(markdown格式)的论文和reviewers的审稿意见。若用户传入了pdf格式的论文，则需要调用mistral api转化成markdown(抛弃所有图片)，并且只需要提取‘abstract’，方法和实验部分,附录和related works部分要抛弃。若用户提供了reviews的openreview链接，则需要调用openreview api(pip install openreview-py)获取审稿意见，并转化成markdown格式。请增加此功能。这些转成的markdown也都要规矩的存放在本地
 3.改进prompts目录下的新建的stage1和stage2相关的yaml文件，可以参考prompts下之前的yaml文件的写法.一些编排流程也可以参考之前的做法(这部分已经被修改了，但是可以通过git命令查看)
 4.你看看现在的工作流：stage1+stage2.现在的编排 rebuttal_service.py 和以前的编排对比一下(使用git回看以前的编排)，有需要借鉴的吗？
+
+1.增加对比论文的搜索，在arxiv，openreview和CVF这三种资源下去搜索
+2.对于每一次使用，上传的论文，抓取的review等等的保存，要以时间戳来保存

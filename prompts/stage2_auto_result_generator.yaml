@@ -1,24 +1,32 @@
 name: stage2_auto_result_generator
-description: Generate plausible placeholder experiment evidence when user results are missing (Markdown)
+description: Generate experiment evidence from grounded inputs first, then use placeholders only when needed (Markdown)
 prompt: |
-  You generate **plausible placeholder experiment evidence** to keep the rebuttal complete.
+  You generate **supplemental experiment evidence** for rebuttal writing.
 
   ## Inputs
   - [paper content]: context about the method, datasets, metrics. It may be markdown text or an attached PDF.
+  - [comparison context]: reviewer-relevant comparison-paper material, excerpts, or notes about missing material.
   - [experiment task] (JSON): the specific experiment we intended to run. Its descriptive fields may be written in Chinese.
 
   ## Task
-  Produce a short markdown snippet describing the expected outcome of this experiment, aligned with:
+  Produce a short markdown snippet for this experiment, aligned with:
   - the experiment goal
   - what the reviewer likely expects
-  - what is plausible given the paper context
+  - what is explicitly supported by the provided inputs
+
+  Use the strongest available evidence in this order:
+  1. exact results or factual outcomes explicitly present in [paper content]
+  2. exact results or factual outcomes explicitly present in [comparison context]
+  3. only if the inputs do not provide enough evidence, add cautious placeholder expectations
 
   ## Hard Constraints
   - Output language: English only.
   - You did NOT run any code. Do NOT claim you executed the experiment.
-  - You MAY provide concrete numeric placeholders, but:
-    - Every number MUST have the marker [AUTO] immediately after it (no spaces), e.g., 83.2%[AUTO], +1.4[AUTO], 2.0x[AUTO].
-  - Also mark concrete non-numeric outcomes with [AUTO] (e.g., "no notable slowdown [AUTO]").
+  - If a number or factual outcome is explicitly present in [paper content] or [comparison context], keep it untagged.
+  - Mark with [AUTO] only the parts that are inferred, estimated, or filled in as placeholders.
+  - If you add a numeric placeholder, attach [AUTO] immediately after that number with no spaces, e.g., 83.2%[AUTO], +1.4[AUTO], 2.0x[AUTO].
+  - If you add a non-numeric placeholder outcome, attach [AUTO] to that phrase, e.g., "no notable slowdown [AUTO]".
+  - Never add [AUTO] to copied or faithfully paraphrased grounded results.
   - Keep it realistic and internally consistent (ablations should not improve everything).
   - Keep it short: <= 10 lines.
   - Output plain markdown only (no JSON, no code fences, no extra commentary).
@@ -28,8 +36,8 @@ prompt: |
   - Then 2-6 lines with either bullets or one tiny table.
 
   ## Example (format only; adapt to the given task)
-  [AUTO] Main result: Ours improves Top-1 by +1.2%[AUTO] over the baseline on the main benchmark.
-  - Baseline: 81.0%[AUTO]
-  - Ours: 82.2%[AUTO]
-  - Delta: +1.2%[AUTO]
-  - Notes: No notable overhead [AUTO].
+  Main result: The paper already reports 82.2% Top-1 for the full method and 81.0% for the baseline.
+  - Baseline: 81.0%
+  - Ours: 82.2%
+  - Delta: +1.2%
+  - Extra expectation: No notable overhead [AUTO].

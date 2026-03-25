@@ -13,7 +13,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.request
 import urllib.parse
 import threading
-from arxiv import _fetch_metadata_by_id
+from typing import Any, Dict, List, Optional
+from arxiv import _extract_arxiv_id_from_url, _fetch_metadata_by_id, search_relevant_papers
 
 try:
     if hasattr(sys.stdout, "reconfigure"):
@@ -23,6 +24,10 @@ except Exception:
 
 ARXIV_DIRECT_OPENER = urllib.request.build_opener()
 ARXIV_HOSTS = {"arxiv.org", "www.arxiv.org", "export.arxiv.org"}
+OPENREVIEW_HOSTS = {"openreview.net", "api2.openreview.net"}
+CVF_HOSTS = {"openaccess.thecvf.com", "thecvf.com", "www.thecvf.com"}
+CVF_CONFERENCES = ("CVPR", "ICCV", "ECCV", "WACV")
+CVF_INDEX_CACHE = {}
             
 PDF_CONVERT_LOCK = threading.Lock()
 
@@ -436,18 +441,475 @@ def fetch_openreview_reviews_markdown(openreview_url: str) -> str:
         raise ValueError("No Official_Review/Meta_Review notes found for this forum.")
     out = "\n".join(md_lines).strip()
     return out + "\n"
+
+
+def _http_get_text(url: str, timeout: int = 30) -> str:
+    import requests
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        )
+    }
+    resp = requests.get(url, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    return resp.text
+
+
+def _unwrap_openreview_value(value: Any) -> Any:
+    if isinstance(value, dict) and "value" in value:
+        return value.get("value")
+    return value
+
+
+def _normalize_search_text(text: str) -> str:
+    cleaned = re.sub(r"https?://\S+", " ", str(text or "").lower())
+    cleaned = re.sub(r"[^a-z0-9]+", " ", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _comparison_match_score(query: str, title: str) -> float:
+    query_norm = _normalize_search_text(query)
+    title_norm = _normalize_search_text(title)
+    if not query_norm or not title_norm:
+        return 0.0
+    if query_norm == title_norm:
+        return 1.0
+    if query_norm in title_norm or title_norm in query_norm:
+        return 0.92 if len(query_norm.split()) >= 2 else 0.78
+
+    query_tokens = set(query_norm.split())
+    title_tokens = set(title_norm.split())
+    if not query_tokens or not title_tokens:
+        return 0.0
+
+    overlap = len(query_tokens & title_tokens)
+    union = len(query_tokens | title_tokens)
+    score = overlap / max(1, union)
+    if len(query_tokens) <= 3 and query_tokens.issubset(title_tokens):
+        score = max(score, 0.8)
+    return score
+
+
+def _is_probable_url(text: str) -> bool:
+    try:
+        parsed = urllib.parse.urlparse((text or "").strip())
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+    except Exception:
+        return False
+
+
+def _hostname_from_url(url: str) -> str:
+    try:
+        return (urllib.parse.urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def _dedupe_paper_candidates(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    output: List[Dict[str, Any]] = []
+    seen = set()
+    for item in sorted(candidates, key=lambda x: float(x.get("score", 0.0)), reverse=True):
+        source = str(item.get("source", "") or "")
+        title_key = _normalize_search_text(item.get("title", ""))
+        page_key = str(item.get("abs_url", "") or item.get("pdf_url", "") or "")
+        key = (source, title_key, page_key)
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(item)
+    return output
+
+
+def _candidate_to_saved_hit(item: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "source": str(item.get("source", "") or ""),
+        "title": str(item.get("title", "") or ""),
+        "abs_url": str(item.get("abs_url", "") or ""),
+        "pdf_url": str(item.get("pdf_url", "") or ""),
+        "paper_id": str(item.get("paper_id", "") or ""),
+        "score": round(float(item.get("score", 0.0)), 4),
+    }
+
+
+def _should_auto_download(query: str, candidate: Dict[str, Any]) -> bool:
+    reason = str(candidate.get("match_reason", "") or "")
+    score = float(candidate.get("score", 0.0) or 0.0)
+    query_norm = _normalize_search_text(query)
+    title_norm = _normalize_search_text(candidate.get("title", ""))
+
+    if reason == "direct_url":
+        return True
+    if score >= 0.86:
+        return True
+    if query_norm and len(query_norm.split()) <= 3 and query_norm in title_norm and score >= 0.72:
+        return True
+    return False
+
+
+def _build_openreview_client():
+    import openreview
+
+    baseurl = (os.environ.get("OPENREVIEW_BASEURL") or "https://api2.openreview.net").strip()
+    username = (os.environ.get("OPENREVIEW_USERNAME") or "").strip()
+    password = (os.environ.get("OPENREVIEW_PASSWORD") or "").strip()
+
+    kwargs = {"baseurl": baseurl}
+    if username and password:
+        kwargs.update({"username": username, "password": password})
+    return openreview.api.OpenReviewClient(**kwargs)
+
+
+def _openreview_note_to_paper(note: Any) -> Dict[str, Any]:
+    content = getattr(note, "content", {}) or {}
+    title = str(_unwrap_openreview_value(content.get("title", "")) or "").strip()
+    abstract = str(_unwrap_openreview_value(content.get("abstract", "")) or "").strip()
+    raw_authors = _unwrap_openreview_value(content.get("authors", [])) or []
+    if isinstance(raw_authors, str):
+        authors = [raw_authors]
+    else:
+        authors = [str(x).strip() for x in raw_authors if str(x).strip()]
+
+    note_id = str(getattr(note, "id", "") or "").strip()
+    forum_id = str(getattr(note, "forum", "") or "").strip() or note_id
+    created_at = getattr(note, "cdate", None) or getattr(note, "tcdate", None)
+    published = ""
+    if isinstance(created_at, (int, float)):
+        published = time.strftime("%Y-%m-%d", time.localtime(created_at / 1000 if created_at > 10**12 else created_at))
+
+    return {
+        "source": "openreview",
+        "paper_id": note_id or forum_id,
+        "title": title,
+        "abstract": abstract,
+        "authors": authors,
+        "abs_url": f"https://openreview.net/forum?id={forum_id}" if forum_id else "",
+        "pdf_url": f"https://openreview.net/pdf?id={note_id or forum_id}" if (note_id or forum_id) else "",
+        "published": published,
+    }
+
+
+def fetch_openreview_submission_markdown(openreview_url: str) -> Optional[Dict[str, Any]]:
+    try:
+        forum_id = openreview_forum_url_to_id(openreview_url)
+        client = _build_openreview_client()
+        try:
+            note = client.get_note(forum_id)
+        except Exception:
+            notes = client.get_all_notes(forum=forum_id) or []
+            note = None
+            for item in notes:
+                if str(getattr(item, "id", "") or "") == forum_id:
+                    note = item
+                    break
+            if note is None and notes:
+                note = notes[0]
+        if note is None:
+            return None
+        paper = _openreview_note_to_paper(note)
+        paper["match_reason"] = "direct_url"
+        paper["score"] = 1.0
+        return paper
+    except Exception:
+        return None
+
+
+def search_openreview_papers(query: str, max_results: int = 3) -> List[Dict[str, Any]]:
+    query_text = str(query or "").strip()
+    if not query_text:
+        return []
+    if _is_probable_url(query_text):
+        item = fetch_openreview_submission_markdown(query_text)
+        return [item] if item else []
+
+    try:
+        client = _build_openreview_client()
+        notes = client.get_notes(content={"title": query_text}, limit=max_results) or []
+    except Exception:
+        return []
+
+    results: List[Dict[str, Any]] = []
+    for note in notes:
+        paper = _openreview_note_to_paper(note)
+        if not paper.get("title"):
+            continue
+        paper["score"] = _comparison_match_score(query_text, paper.get("title", ""))
+        paper["match_reason"] = "exact_title"
+        results.append(paper)
+    return _dedupe_paper_candidates(results)[:max_results]
+
+
+def _derive_cvf_html_url(url: str) -> str:
+    if not url:
+        return ""
+    if url.endswith(".html"):
+        return url
+    if url.endswith(".pdf"):
+        return url.replace("/papers/", "/html/").replace(".pdf", ".html")
+    return url
+
+
+def _derive_cvf_pdf_url(url: str) -> str:
+    if not url:
+        return ""
+    if url.endswith(".pdf"):
+        return url
+    if url.endswith(".html"):
+        return url.replace("/html/", "/papers/").replace(".html", ".pdf")
+    return url
+
+
+def _fetch_cvf_paper_page(url: str) -> Optional[Dict[str, Any]]:
+    try:
+        from bs4 import BeautifulSoup
+
+        html_url = _derive_cvf_html_url(url)
+        soup = BeautifulSoup(_http_get_text(html_url, timeout=40), "html.parser")
+
+        def meta_value(name: str) -> str:
+            tag = soup.find("meta", attrs={"name": name})
+            return str(tag.get("content", "") or "").strip() if tag else ""
+
+        title = meta_value("citation_title")
+        abstract = meta_value("citation_abstract")
+        authors = [
+            str(tag.get("content", "") or "").strip()
+            for tag in soup.find_all("meta", attrs={"name": "citation_author"})
+            if str(tag.get("content", "") or "").strip()
+        ]
+        pdf_url = meta_value("citation_pdf_url") or _derive_cvf_pdf_url(html_url)
+        if pdf_url and pdf_url.startswith("/"):
+            pdf_url = urllib.parse.urljoin(html_url, pdf_url)
+
+        paper_id = os.path.splitext(os.path.basename(_derive_cvf_pdf_url(pdf_url or html_url)))[0]
+        return {
+            "source": "cvf",
+            "paper_id": paper_id,
+            "title": title,
+            "abstract": abstract,
+            "authors": authors,
+            "abs_url": html_url,
+            "pdf_url": pdf_url,
+            "published": "",
+        }
+    except Exception:
+        return None
+
+
+def _fetch_cvf_index(conference: str, year: int) -> List[Dict[str, Any]]:
+    cache_key = f"{conference}{year}"
+    if cache_key in CVF_INDEX_CACHE:
+        return CVF_INDEX_CACHE[cache_key]
+
+    try:
+        from bs4 import BeautifulSoup
+    except Exception:
+        CVF_INDEX_CACHE[cache_key] = []
+        return []
+
+    url = f"https://openaccess.thecvf.com/{conference}{year}?day=all"
+    try:
+        soup = BeautifulSoup(_http_get_text(url, timeout=40), "html.parser")
+    except Exception:
+        CVF_INDEX_CACHE[cache_key] = []
+        return []
+
+    items: List[Dict[str, Any]] = []
+    seen = set()
+    for anchor in soup.find_all("a", href=True):
+        href = str(anchor.get("href", "") or "").strip()
+        if "/content/" not in href or not href.endswith(".html"):
+            continue
+        title = " ".join(anchor.get_text(" ", strip=True).split())
+        if len(title) < 8:
+            continue
+        abs_url = urllib.parse.urljoin(url, href)
+        if abs_url in seen:
+            continue
+        seen.add(abs_url)
+        pdf_url = _derive_cvf_pdf_url(abs_url)
+        paper_id = os.path.splitext(os.path.basename(pdf_url))[0]
+        items.append(
+            {
+                "source": "cvf",
+                "paper_id": paper_id,
+                "title": title,
+                "abstract": "",
+                "authors": [],
+                "abs_url": abs_url,
+                "pdf_url": pdf_url,
+                "published": f"{conference} {year}",
+            }
+        )
+
+    CVF_INDEX_CACHE[cache_key] = items
+    return items
+
+
+def _candidate_cvf_years(query: str) -> List[int]:
+    current_year = time.localtime().tm_year
+    years = [int(x) for x in re.findall(r"\b(20\d{2})\b", str(query or ""))]
+    if years:
+        base = years[0]
+        ordered = [base, base + 1, base - 1]
+    else:
+        ordered = [current_year, current_year - 1, current_year - 2]
+
+    output = []
+    seen = set()
+    for year in ordered:
+        if year < 2018 or year > current_year:
+            continue
+        if year in seen:
+            continue
+        seen.add(year)
+        output.append(year)
+    return output
+
+
+def _candidate_cvf_conferences(query: str) -> List[str]:
+    query_upper = str(query or "").upper()
+    hinted = [conf for conf in CVF_CONFERENCES if conf in query_upper]
+    if hinted:
+        return hinted
+    return list(CVF_CONFERENCES)
+
+
+def search_cvf_papers(query: str, max_results: int = 3) -> List[Dict[str, Any]]:
+    query_text = str(query or "").strip()
+    if not query_text:
+        return []
+    if _is_probable_url(query_text) and _hostname_from_url(query_text) in CVF_HOSTS:
+        item = _fetch_cvf_paper_page(query_text)
+        if item:
+            item["score"] = 1.0
+            item["match_reason"] = "direct_url"
+            return [item]
+        return []
+
+    candidates: List[Dict[str, Any]] = []
+    pages_checked = 0
+    for conference in _candidate_cvf_conferences(query_text):
+        for year in _candidate_cvf_years(query_text):
+            pages_checked += 1
+            for item in _fetch_cvf_index(conference, year):
+                score = _comparison_match_score(query_text, item.get("title", ""))
+                if score < 0.42:
+                    continue
+                candidate = dict(item)
+                candidate["score"] = score
+                candidate["match_reason"] = "search"
+                candidates.append(candidate)
+            if pages_checked >= 6:
+                break
+        strong_hits = [x for x in candidates if float(x.get("score", 0.0)) >= 0.8]
+        if len(strong_hits) >= max_results or pages_checked >= 6:
+            break
+
+    output: List[Dict[str, Any]] = []
+    for item in _dedupe_paper_candidates(candidates):
+        if len(output) >= max_results:
+            break
+        enriched = _fetch_cvf_paper_page(item.get("abs_url", "")) or item
+        enriched["score"] = float(item.get("score", 0.0))
+        enriched["match_reason"] = str(item.get("match_reason", "") or "search")
+        output.append(enriched)
+    return output
+
+
+def _paper_from_arxiv_url(url: str) -> Optional[Dict[str, Any]]:
+    arxiv_id = _extract_arxiv_id_from_url(url)
+    if not arxiv_id:
+        return None
+    data = _fetch_metadata_by_id(arxiv_id)
+    if not data:
+        return None
+    data["source"] = "arxiv"
+    data["paper_id"] = str(data.get("arxiv_id", "") or arxiv_id)
+    data["match_reason"] = "direct_url"
+    data["score"] = 1.0
+    return data
+
+
+def search_arxiv_comparison_papers(query: str, max_results: int = 3) -> List[Dict[str, Any]]:
+    query_text = str(query or "").strip()
+    if not query_text:
+        return []
+    if _is_probable_url(query_text) and _hostname_from_url(query_text) in ARXIV_HOSTS:
+        item = _paper_from_arxiv_url(query_text)
+        return [item] if item else []
+
+    candidates: List[Dict[str, Any]] = []
+    for field_name in ("title", "all"):
+        try:
+            papers = search_relevant_papers(query_text, max_results=max_results, field=field_name)
+        except Exception:
+            papers = []
+        for paper in papers:
+            item = dict(paper)
+            item["source"] = "arxiv"
+            item["paper_id"] = str(item.get("arxiv_id", "") or "")
+            item["score"] = _comparison_match_score(query_text, item.get("title", ""))
+            item["match_reason"] = f"search_{field_name}"
+            candidates.append(item)
+    return _dedupe_paper_candidates(candidates)[:max_results]
+
+
+def resolve_comparison_paper(query: str, output_dir: str, max_results_per_source: int = 3) -> Dict[str, Any]:
+    query_text = str(query or "").strip()
+    if not query_text:
+        return {"hits": [], "resolved_source": "", "resolved_md_path": ""}
+
+    candidates: List[Dict[str, Any]] = []
+    hostname = _hostname_from_url(query_text) if _is_probable_url(query_text) else ""
+    if hostname in ARXIV_HOSTS:
+        item = _paper_from_arxiv_url(query_text)
+        if item:
+            candidates.append(item)
+    elif hostname in OPENREVIEW_HOSTS:
+        item = fetch_openreview_submission_markdown(query_text)
+        if item:
+            candidates.append(item)
+    elif hostname in CVF_HOSTS:
+        item = _fetch_cvf_paper_page(query_text)
+        if item:
+            item["score"] = 1.0
+            item["match_reason"] = "direct_url"
+            candidates.append(item)
+    else:
+        candidates.extend(search_arxiv_comparison_papers(query_text, max_results=max_results_per_source))
+        candidates.extend(search_openreview_papers(query_text, max_results=max_results_per_source))
+        candidates.extend(search_cvf_papers(query_text, max_results=max_results_per_source))
+
+    ranked = _dedupe_paper_candidates(candidates)
+    ranked.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
+    top_hits = ranked[:max_results_per_source]
+
+    resolved_source = ""
+    resolved_md_path = ""
+    if top_hits and _should_auto_download(query_text, top_hits[0]):
+        os.makedirs(output_dir, exist_ok=True)
+        resolved_md_path = download_pdf_and_convert_md(top_hits[0], output_dir, convert_to_markdown=False) or ""
+        if resolved_md_path:
+            resolved_source = str(top_hits[0].get("source", "") or "")
+
+    return {
+        "hits": [_candidate_to_saved_hit(item) for item in top_hits],
+        "resolved_source": resolved_source,
+        "resolved_md_path": resolved_md_path,
+    }
+
+
 def _safe_filename(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*]+', '_', name)[:100]
 
-def download_pdf_and_convert_md(paper: dict, output_dir: str) -> str | None:
-    """Download PDF and convert to Markdown.
-    
-    If download or conversion fails, creates a file containing paper metadata.
-    Returns the file path.
-    
-    Args:
-        paper: Dictionary containing paper metadata (title, arxiv_id, pdf_url, etc.)
-        output_dir: Directory to save downloaded PDFs and converted Markdown files
+def download_pdf_and_convert_md(paper: dict, output_dir: str, convert_to_markdown: bool = True) -> str | None:
+    """Download a paper PDF and convert it to Markdown.
+
+    If download or conversion fails, creates a fallback Markdown file containing
+    the available metadata and URLs.
     """
     papers_dir = output_dir
     
@@ -458,19 +920,23 @@ def download_pdf_and_convert_md(paper: dict, output_dir: str) -> str | None:
         """Create a Markdown file containing basic paper information"""
         title = paper.get('title', 'Unknown Paper')
         abstract = paper.get('abstract', 'No abstract available')
-        arxiv_id = paper.get('arxiv_id', 'N/A')
+        source = paper.get('source', 'unknown')
+        paper_id = paper.get('paper_id') or paper.get('arxiv_id') or 'N/A'
         pdf_url = paper.get('pdf_url', '')
-        abs_url = paper.get('abs_url', '')
+        abs_url = paper.get('abs_url') or paper.get('source_url') or ''
         authors = paper.get('authors', [])
+        published = paper.get('published', '')
         
         authors_str = ', '.join(authors) if authors else 'Unknown'
         
         md_content = f"""# {title}
 
-**arXiv ID**: {arxiv_id}  
+**Source**: {source}  
+**Paper ID**: {paper_id}  
 **Authors**: {authors_str}  
+**Published**: {published}  
 **PDF URL**: {pdf_url}  
-**Abstract URL**: {abs_url}  
+**Page URL**: {abs_url}  
 
 ---
 
@@ -500,11 +966,11 @@ def download_pdf_and_convert_md(paper: dict, output_dir: str) -> str | None:
     
     try:
         print(f"[DEBUG] Starting paper download: {paper.get('title', 'Unknown')[:60]}...")
-        print(f"[DEBUG] arXiv ID: {paper.get('arxiv_id', 'N/A')}")
+        print(f"[DEBUG] Source: {paper.get('source', 'unknown')}, paper_id: {paper.get('paper_id') or paper.get('arxiv_id', 'N/A')}")
         
-        title = paper.get('title') or paper.get('arxiv_id') or 'paper'
-        arxiv_id = paper.get('arxiv_id') or ''
-        base_name = f"{arxiv_id}_{title[:50]}" if arxiv_id else title[:50]
+        title = paper.get('title') or paper.get('paper_id') or paper.get('arxiv_id') or 'paper'
+        paper_id = paper.get('paper_id') or paper.get('arxiv_id') or ''
+        base_name = f"{paper_id}_{title[:50]}" if paper_id else title[:50]
         safe = _safe_filename(base_name)
         
         pdf_url = paper.get('pdf_url') or ''
@@ -516,7 +982,10 @@ def download_pdf_and_convert_md(paper: dict, output_dir: str) -> str | None:
             pdf_url = pdf_url + '.pdf'
         
         if not pdf_url:
-            print(f"[WARNING] Unable to get PDF URL, creating fallback Markdown")
+            print(f"[WARNING] Unable to get PDF URL")
+            if not convert_to_markdown:
+                return None
+            print(f"[INFO] Creating fallback Markdown (metadata only)")
             return create_fallback_markdown_file(paper, safe, "Unable to get PDF URL")
         
         print(f"[DEBUG] PDF URL: {pdf_url}")
@@ -602,12 +1071,17 @@ def download_pdf_and_convert_md(paper: dict, output_dir: str) -> str | None:
                 
         except Exception as e:
             print(f"[ERROR] PDF download failed (all retries exhausted): {type(e).__name__}: {e}")
+            if not convert_to_markdown:
+                return None
             print(f"[INFO] Creating fallback Markdown (metadata only)")
             return create_fallback_markdown_file(paper, safe, f"PDF download failed: {str(e)}")
         
+        if not convert_to_markdown:
+            return pdf_path
+
         print(f"[DEBUG] Starting PDF to Markdown conversion...")
         md_path = pdf_to_md(pdf_path, papers_dir)
-        
+
         if md_path and os.path.isfile(md_path):
             print(f"[SUCCESS] Markdown conversion successful: {md_path}")
             return md_path
@@ -619,7 +1093,8 @@ def download_pdf_and_convert_md(paper: dict, output_dir: str) -> str | None:
         print(f"[WARNING] download_pdf_and_convert_md exception: {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
-        
+        if not convert_to_markdown:
+            return None
         try:
             title = paper.get('title') or paper.get('arxiv_id') or 'paper'
             arxiv_id = paper.get('arxiv_id') or ''

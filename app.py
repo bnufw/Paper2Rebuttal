@@ -160,6 +160,10 @@ def _copy_one_file(src_path: str, dst_path: str) -> str:
     return dst_path
 
 
+def _build_session_id() -> str:
+    return f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+
+
 def _format_stage1_reviewer_summaries(rows: List[Dict[str, Any]]) -> str:
     if not rows:
         return "（空）"
@@ -211,7 +215,12 @@ def _format_comparison_needs(rows: List[Dict[str, Any]]) -> str:
         title = row.get("paper_title", "")
         reviewers = ", ".join(row.get("mentioned_by_reviewer", []) or [])
         reason = row.get("reason", "")
-        status_text = "已提供" if status == "provided" else "缺失"
+        status_text = {
+            "uploaded": "已上传",
+            "provided": "已上传",
+            "searched": "已检索",
+            "missing": "缺失",
+        }.get(status, status)
         lines.append(f"- [{status_text}] {title}")
         lines.append(f"  - 提及 reviewer：{reviewers}")
         if reason:
@@ -219,6 +228,21 @@ def _format_comparison_needs(rows: List[Dict[str, Any]]) -> str:
         provided = row.get("provided_md_path", "")
         if provided:
             lines.append(f"  - 已提供 md：{os.path.basename(provided)}")
+        resolved = row.get("resolved_md_path", "")
+        if resolved and resolved != provided:
+            lines.append(f"  - 检索结果文件：{os.path.basename(resolved)}")
+        source = row.get("resolved_source", "")
+        if source:
+            lines.append(f"  - 来源：{source}")
+        hits = row.get("search_hits", []) or []
+        if hits:
+            hit_text = "; ".join(
+                f"{hit.get('source', '?')}: {hit.get('title', '')}"
+                for hit in hits[:3]
+                if hit.get("title")
+            )
+            if hit_text:
+                lines.append(f"  - 候选：{hit_text}")
     return "\n".join(lines)
 
 
@@ -274,14 +298,16 @@ def list_recent_sessions(limit: int = 200) -> List[tuple[str, str]]:
             paper_path = str(meta.get("paper_path", "") or "")
             paper_name = os.path.basename(paper_path) if paper_path else "paper?"
 
+            created_at = str(meta.get("created_at", "") or "")
             saved_at = str(meta.get("saved_at", "") or "")
-            ts = _parse_saved_at_ts(saved_at) if saved_at else 0.0
+            ts_source = saved_at or created_at
+            ts = _parse_saved_at_ts(ts_source) if ts_source else 0.0
             if ts <= 0:
                 try:
                     ts = float(os.path.getmtime(meta_path))
                 except Exception:
                     ts = 0.0
-            saved_at_disp = saved_at or (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "unknown")
+            saved_at_disp = created_at or saved_at or (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "unknown")
 
             label = f"{session_id} | {saved_at_disp} | S1:{has_stage1} S2:{has_stage2} | {paper_name}"
             items.append((label, session_id, ts))
@@ -454,14 +480,17 @@ def _get_saved_stage1_inputs(session) -> tuple[str, str, List[str]]:
     review_src = review_candidate if os.path.exists(review_candidate) else session.review_path
 
     comparison_paths: List[str] = []
-    if os.path.isdir(comparisons_dir):
+    uploaded_paths = getattr(session, "uploaded_comparison_paths", None) or []
+    if uploaded_paths:
+        comparison_paths = [path for path in uploaded_paths if os.path.exists(path)]
+    elif os.path.isdir(comparisons_dir):
         comparison_paths = [
             os.path.join(comparisons_dir, name)
             for name in sorted(os.listdir(comparisons_dir))
-            if os.path.isfile(os.path.join(comparisons_dir, name))
+            if os.path.isfile(os.path.join(comparisons_dir, name)) and name.lower().endswith(".md")
         ]
     elif session.comparison_paths:
-        comparison_paths = [path for path in session.comparison_paths if os.path.exists(path)]
+        comparison_paths = [path for path in session.comparison_paths if os.path.exists(path) and path.lower().endswith(".md")]
 
     return paper_src, review_src, comparison_paths
 
@@ -506,7 +535,7 @@ def run_stage1(
         else:
             review_src = review_paths[0]
 
-        session_id = str(uuid.uuid4())[:8]
+        session_id = _build_session_id()
         saved_paper_path, saved_review_md, saved_comparisons = _prepare_stage1_inputs(
             session_id=session_id,
             paper_src=paper_src,
@@ -562,7 +591,7 @@ def rerun_stage1_from_history(
         provider_key = PROVIDER_CONFIGS.get(provider_choice, PROVIDER_CONFIGS["OpenRouter"])["provider_key"]
 
         paper_src, review_src, comparison_paths = _get_saved_stage1_inputs(source_session)
-        session_id = str(uuid.uuid4())[:8]
+        session_id = _build_session_id()
         saved_paper_path, saved_review_md, saved_comparisons = _prepare_stage1_inputs(
             session_id=session_id,
             paper_src=paper_src,
@@ -829,9 +858,9 @@ with gr.Blocks(title="Paper2Rebuttal Personal") as demo:
   - overall reviewer opinion summary
   - per-reviewer summary
   - supplemental experiment plan (copyable coding prompts)
-  - missing comparison-paper list
+  - comparison-paper resolution from uploaded files plus automatic search in arXiv / OpenReview / CVF, with search hits saved as PDF under the session `comparisons` folder
 - Stage2: Upload experiment-result `.md` (optional) and additional comparison `.md` (optional), then generate final rebuttal blocks per reviewer (English, each <= 5000 chars).
-- If results are missing, the system generates reasonable placeholders with `[AUTO]` markers.
+- If result files are missing, the system first reuses grounded results already present in the paper or comparison materials; only filled-in placeholders carry `[AUTO]`.
 
 Stage1 inputs:
 - Paper: `.md` or `.pdf` (`Gemini + PDF` uses native PDF input; other providers still convert PDF to Markdown via Mistral OCR)
@@ -903,7 +932,7 @@ Stage1 inputs:
             placeholder="https://openreview.net/forum?id=...",
         )
         comparison_input = gr.File(
-            label="Comparison Papers Markdown (.md, optional, multiple)",
+            label="Comparison Papers Markdown (.md, optional, multiple, uploaded files override auto search)",
             file_types=[".md"],
             file_count="multiple",
         )
@@ -924,7 +953,7 @@ Stage1 inputs:
                 file_count="multiple",
             )
             stage2_comparison_input = gr.File(
-                label="Additional Comparison Papers (.md, optional, multiple)",
+                label="Additional Comparison Papers (.md, optional, multiple, higher priority than auto search)",
                 file_types=[".md"],
                 file_count="multiple",
             )

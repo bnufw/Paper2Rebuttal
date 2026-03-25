@@ -1,4 +1,5 @@
 docling==2.30.0
+beautifulsoup4>=4.12.0
 fastapi==0.128.0
 gradio==6.2.0
 httpx[socks]==0.28.1
