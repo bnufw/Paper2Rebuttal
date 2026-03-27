@@ -1,9 +1,11 @@
 import urllib.parse
 import urllib.request
+import urllib.error
 import xml.etree.ElementTree as ET
 import os
 import re
 import time
+import random
 import tarfile
 import shutil
 import subprocess
@@ -24,6 +26,74 @@ DIRECT_OPENER = urllib.request.build_opener()
 
 ARXIV_API = "https://export.arxiv.org/api/query"
 ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
+ARXIV_REQUEST_TIMEOUT = 30
+ARXIV_MAX_RETRIES = 4
+ARXIV_MIN_QUERY_INTERVAL = 3.0
+ARXIV_SEARCH_CACHE_TTL = 600.0
+ARXIV_EMPTY_SEARCH_CACHE_TTL = 120.0
+ARXIV_METADATA_CACHE_TTL = 3600.0
+_ARXIV_LAST_QUERY_TS = 0.0
+_ARXIV_SEARCH_CACHE: Dict[tuple[str, int], tuple[float, List[Dict]]] = {}
+_ARXIV_METADATA_CACHE: Dict[str, tuple[float, Dict]] = {}
+
+
+def _clone_papers(papers: List[Dict]) -> List[Dict]:
+    return [dict(paper) for paper in papers]
+
+
+def _sleep_before_arxiv_query() -> None:
+    global _ARXIV_LAST_QUERY_TS
+    elapsed = time.time() - _ARXIV_LAST_QUERY_TS
+    wait_seconds = ARXIV_MIN_QUERY_INTERVAL - elapsed
+    if wait_seconds > 0:
+        print(f"[DEBUG] Waiting {wait_seconds:.1f} seconds before arXiv request...")
+        time.sleep(wait_seconds)
+    _ARXIV_LAST_QUERY_TS = time.time()
+
+
+def _search_cache_key(query: str, max_results: int) -> tuple[str, int]:
+    return ((query or "").strip(), int(max_results))
+
+
+def _get_cached_search_result(query: str, max_results: int) -> Optional[List[Dict]]:
+    cached = _ARXIV_SEARCH_CACHE.get(_search_cache_key(query, max_results))
+    if not cached:
+        return None
+    expires_at, papers = cached
+    if time.time() >= expires_at:
+        _ARXIV_SEARCH_CACHE.pop(_search_cache_key(query, max_results), None)
+        return None
+    print(f"[DEBUG] Using cached arXiv search result for query: '{query[:80]}'")
+    return _clone_papers(papers)
+
+
+def _set_cached_search_result(query: str, max_results: int, papers: List[Dict]) -> None:
+    ttl = ARXIV_SEARCH_CACHE_TTL if papers else ARXIV_EMPTY_SEARCH_CACHE_TTL
+    _ARXIV_SEARCH_CACHE[_search_cache_key(query, max_results)] = (
+        time.time() + ttl,
+        _clone_papers(papers),
+    )
+
+
+def _get_cached_metadata(arxiv_id: str) -> Optional[Dict]:
+    cached = _ARXIV_METADATA_CACHE.get(arxiv_id)
+    if not cached:
+        return None
+    expires_at, paper = cached
+    if time.time() >= expires_at:
+        _ARXIV_METADATA_CACHE.pop(arxiv_id, None)
+        return None
+    print(f"[DEBUG] Using cached arXiv metadata for id: {arxiv_id}")
+    return dict(paper)
+
+
+def _set_cached_metadata(arxiv_id: str, paper: Dict) -> None:
+    _ARXIV_METADATA_CACHE[arxiv_id] = (time.time() + ARXIV_METADATA_CACHE_TTL, dict(paper))
+
+
+def _retry_wait_seconds(attempt_index: int) -> float:
+    base = min(20.0, 2.0 * (2 ** attempt_index))
+    return base + random.uniform(0.3, 1.2)
 
 class ArxivAgent:
     def __init__(self, max_results: int = 30, pdf_dir: str = "arxiv_papers", 
@@ -100,6 +170,10 @@ class ArxivAgent:
         return downloaded_files
     
     def _search_arxiv(self, query: str, max_results: int = 10) -> List[Dict]:
+        cached = _get_cached_search_result(query, max_results)
+        if cached is not None:
+            return cached
+
         params = {
             "search_query": query,
             "start": 0,
@@ -114,27 +188,51 @@ class ArxivAgent:
             url,
             headers={"User-Agent": "arxiv-agent/1.0 (research@example.com)"}
         )
-        
-        try:
-            print(f"[DEBUG] Sending request, timeout set to 30 seconds...")
-            with DIRECT_OPENER.open(req, timeout=30) as resp:
-                xml_text = resp.read()
-                print(f"[DEBUG] Response received, length: {len(xml_text)} bytes")
-            
-            root = ET.fromstring(xml_text)
-            papers = []
-            
-            for entry in root.findall("atom:entry", ATOM_NS):
-                paper = self._parse_entry(entry)
-                if paper:
-                    papers.append(paper)
-            
-            print(f"[DEBUG] Parsing complete, found {len(papers)} papers")
-            return papers
-            
-        except Exception as e:
-            print(f"[ERROR] Search failed: {type(e).__name__}: {str(e)}")
-            return []
+
+        for attempt in range(ARXIV_MAX_RETRIES):
+            try:
+                _sleep_before_arxiv_query()
+                print(
+                    f"[DEBUG] Sending request, timeout set to {ARXIV_REQUEST_TIMEOUT} seconds "
+                    f"(attempt {attempt + 1}/{ARXIV_MAX_RETRIES})..."
+                )
+                with DIRECT_OPENER.open(req, timeout=ARXIV_REQUEST_TIMEOUT) as resp:
+                    xml_text = resp.read()
+                    print(f"[DEBUG] Response received, length: {len(xml_text)} bytes")
+
+                root = ET.fromstring(xml_text)
+                papers = []
+
+                for entry in root.findall("atom:entry", ATOM_NS):
+                    paper = self._parse_entry(entry)
+                    if paper:
+                        papers.append(paper)
+
+                print(f"[DEBUG] Parsing complete, found {len(papers)} papers")
+                _set_cached_search_result(query, max_results, papers)
+                return papers
+
+            except urllib.error.HTTPError as e:
+                should_retry = e.code in {429, 500, 502, 503, 504} and attempt < ARXIV_MAX_RETRIES - 1
+                print(f"[ERROR] Search failed: HTTPError {e.code}: {e.reason}")
+                if should_retry:
+                    wait_seconds = _retry_wait_seconds(attempt)
+                    print(f"[INFO] Waiting {wait_seconds:.1f} seconds before retry...")
+                    time.sleep(wait_seconds)
+                    continue
+                return []
+            except (urllib.error.URLError, TimeoutError) as e:
+                should_retry = attempt < ARXIV_MAX_RETRIES - 1
+                print(f"[ERROR] Search failed: {type(e).__name__}: {str(e)}")
+                if should_retry:
+                    wait_seconds = _retry_wait_seconds(attempt)
+                    print(f"[INFO] Waiting {wait_seconds:.1f} seconds before retry...")
+                    time.sleep(wait_seconds)
+                    continue
+                return []
+            except Exception as e:
+                print(f"[ERROR] Search failed: {type(e).__name__}: {str(e)}")
+                return []
     
     def _parse_entry(self, entry) -> Optional[Dict]:
         title = (entry.findtext("atom:title", default="", namespaces=ATOM_NS) or "").strip()
@@ -562,42 +660,66 @@ def _extract_arxiv_id_from_url(url: str) -> Optional[str]:
 
 
 def _fetch_metadata_by_id(arxiv_id: str) -> Optional[Dict]:
+    cached = _get_cached_metadata(arxiv_id)
+    if cached is not None:
+        return cached
+
     try:
         query = f"id_list={arxiv_id}"
         url = f"{ARXIV_API}?{query}"
         req = urllib.request.Request(url, headers={"User-Agent": "arxiv-agent/1.0 (metadata)"})
-        with DIRECT_OPENER.open(req, timeout=20) as resp:
-            xml_text = resp.read()
-        root = ET.fromstring(xml_text)
-        entry = root.find("atom:entry", ATOM_NS)
-        if entry is None:
-            return None
-        title = (entry.findtext("atom:title", default="", namespaces=ATOM_NS) or "").strip()
-        summary = (entry.findtext("atom:summary", default="", namespaces=ATOM_NS) or "").strip()
-        published = entry.findtext("atom:published", default="", namespaces=ATOM_NS)
-        abs_url = entry.findtext("atom:id", default=f"https://arxiv.org/abs/{arxiv_id}", namespaces=ATOM_NS)
-        
-        authors = []
-        for a in entry.findall("atom:author", ATOM_NS):
-            name = a.findtext("atom:name", default="", namespaces=ATOM_NS)
-            if name:
-                authors.append(name)
-        
-        pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
-        for link in entry.findall("atom:link", ATOM_NS):
-            if link.attrib.get("type") == "application/pdf":
-                pdf_url = link.attrib.get("href", pdf_url)
-                break
-        source_url = f"https://arxiv.org/e-print/{arxiv_id}"
-        return {
-            "title": " ".join(title.split()),
-            "abstract": " ".join(summary.split()),
-            "published": published,
-            "authors": authors,
-            "abs_url": abs_url,
-            "pdf_url": pdf_url,
-            "source_url": source_url,
-            "arxiv_id": arxiv_id,
-        }
+        for attempt in range(ARXIV_MAX_RETRIES):
+            try:
+                _sleep_before_arxiv_query()
+                with DIRECT_OPENER.open(req, timeout=20) as resp:
+                    xml_text = resp.read()
+                root = ET.fromstring(xml_text)
+                entry = root.find("atom:entry", ATOM_NS)
+                if entry is None:
+                    return None
+                title = (entry.findtext("atom:title", default="", namespaces=ATOM_NS) or "").strip()
+                summary = (entry.findtext("atom:summary", default="", namespaces=ATOM_NS) or "").strip()
+                published = entry.findtext("atom:published", default="", namespaces=ATOM_NS)
+                abs_url = entry.findtext("atom:id", default=f"https://arxiv.org/abs/{arxiv_id}", namespaces=ATOM_NS)
+
+                authors = []
+                for a in entry.findall("atom:author", ATOM_NS):
+                    name = a.findtext("atom:name", default="", namespaces=ATOM_NS)
+                    if name:
+                        authors.append(name)
+
+                pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+                for link in entry.findall("atom:link", ATOM_NS):
+                    if link.attrib.get("type") == "application/pdf":
+                        pdf_url = link.attrib.get("href", pdf_url)
+                        break
+                source_url = f"https://arxiv.org/e-print/{arxiv_id}"
+                paper = {
+                    "title": " ".join(title.split()),
+                    "abstract": " ".join(summary.split()),
+                    "published": published,
+                    "authors": authors,
+                    "abs_url": abs_url,
+                    "pdf_url": pdf_url,
+                    "source_url": source_url,
+                    "arxiv_id": arxiv_id,
+                }
+                _set_cached_metadata(arxiv_id, paper)
+                return paper
+            except urllib.error.HTTPError as e:
+                should_retry = e.code in {429, 500, 502, 503, 504} and attempt < ARXIV_MAX_RETRIES - 1
+                if should_retry:
+                    wait_seconds = _retry_wait_seconds(attempt)
+                    print(f"[WARNING] arXiv metadata request retry in {wait_seconds:.1f} seconds after HTTP {e.code}")
+                    time.sleep(wait_seconds)
+                    continue
+                return None
+            except (urllib.error.URLError, TimeoutError):
+                if attempt < ARXIV_MAX_RETRIES - 1:
+                    wait_seconds = _retry_wait_seconds(attempt)
+                    print(f"[WARNING] arXiv metadata request retry in {wait_seconds:.1f} seconds")
+                    time.sleep(wait_seconds)
+                    continue
+                return None
     except Exception:
         return None

@@ -843,6 +843,8 @@ def search_arxiv_comparison_papers(query: str, max_results: int = 3) -> List[Dic
 
     candidates: List[Dict[str, Any]] = []
     for field_name in ("title", "all"):
+        if field_name == "all" and candidates:
+            break
         try:
             papers = search_relevant_papers(query_text, max_results=max_results, field=field_name)
         except Exception:
